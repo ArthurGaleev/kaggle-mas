@@ -406,6 +406,23 @@ Respond with JSON only.
 
         return train, test
 
+    def _add_ratio_features(
+        self,
+        train: pd.DataFrame,
+        test: pd.DataFrame,
+        pairs: Optional[List[List[str]]] = None,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Ratio features — often more powerful than products for pricing."""
+        if pairs is None:
+            pairs = [("sum", "min_days"), ("amt_reviews", "total_host"),
+                     ("sum", "amt_reviews")]
+        for col_a, col_b in pairs:
+            if col_a in train.columns and col_b in train.columns:
+                feat = f"ratio_{col_a}_{col_b}"
+                train[feat] = train[col_a] / (train[col_b] + 1e-6)
+                test[feat] = test[col_a] / (test[col_b] + 1e-6)
+        return train, test
+
     def _add_log_transforms(
         self,
         train: pd.DataFrame,
@@ -523,6 +540,10 @@ Respond with JSON only.
         if groups.get("interaction_features", {}).get("enabled", True):
             pairs = groups.get("interaction_features", {}).get("pairs")
             train, test = self._add_interaction_features(train, test, pairs=pairs)
+
+        if groups.get("ratio_features", {}).get("enabled", True):
+            ratio_pairs = groups.get("ratio_features", {}).get("pairs")
+            train, test = self._add_ratio_features(train, test, pairs=ratio_pairs)
 
         if groups.get("log_transforms", {}).get("enabled", True):
             log_cols = groups.get("log_transforms", {}).get("columns")
