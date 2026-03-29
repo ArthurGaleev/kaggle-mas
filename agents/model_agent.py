@@ -173,7 +173,7 @@ Return strict JSON only:
       }}
     }},
     "catboost": {{
-      "enabled": false,
+      "enabled": true,
       "n_trials": 10,
       "fixed_params": {{
         "iterations": 1000,
@@ -232,7 +232,21 @@ Respond with JSON only.
                         "reg_lambda":       {"type": "float", "low": 1e-8, "high": 10.0, "log": True},
                     },
                 },
-                "catboost": {"enabled": False},
+                "catboost": {
+                    "enabled": True,
+                    "n_trials": 10,
+                    "fixed_params": {
+                        "iterations": 1000,
+                        "early_stopping_rounds": 50,
+                        "task_type": "GPU",
+                        "verbose": 0,
+                    },
+                    "search_space": {
+                        "depth":         {"type": "int",   "low": 4,    "high": 10},
+                        "learning_rate": {"type": "float", "low": 0.01, "high": 0.3, "log": True},
+                        "l2_leaf_reg":   {"type": "float", "low": 1e-3, "high": 10.0, "log": True},
+                    },
+                },
             },
             "cv_folds": 5,
             "ensemble_method": "inverse_mse",
@@ -302,6 +316,9 @@ Respond with JSON only.
         fixed: Dict[str, Any],
     ) -> Tuple[Any, float]:
         merged = {**fixed, **params}
+        # CatBoost does not handle NaN natively like LightGBM/XGBoost — fill with sentinel
+        X_train = np.where(np.isnan(X_train), -999.0, X_train)
+        X_val = np.where(np.isnan(X_val), -999.0, X_val)
         model = ModelTools.train_catboost(X_train, y_train, X_val, y_val, merged)
         val_pred = np.asarray(model.predict(X_val))
         return model, float(mean_squared_error(y_val, val_pred))
