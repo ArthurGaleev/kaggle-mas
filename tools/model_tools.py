@@ -7,6 +7,7 @@ Install dependencies:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -72,6 +73,36 @@ def gpu_available() -> bool:
     return _GPU_READY
 
 
+def _lgb_val_mse(booster: Any) -> float:
+    """
+    Extract the validation MSE from a trained LightGBM booster.
+
+    LightGBM stores metrics under ``booster.best_score["valid_0"]``.
+    The dict key depends on how the metric was specified:
+
+      metric='mse'  → key is 'l2'   (LightGBM maps 'mse' to its internal 'l2')
+      metric='rmse' → key is 'rmse'
+      metric='l2'   → key is 'l2'
+
+    Querying ``valid_scores.get("mse")`` always returns ``None`` (and therefore
+    ``None or float("nan")`` gives NaN).  We must look for 'l2' first.
+    """
+    valid_scores: Dict[str, float] = booster.best_score.get("valid_0", {})
+    # LightGBM internal aliases for MSE
+    for key in ("l2", "mean_squared_error", "mse", "regression_l2"):
+        if key in valid_scores:
+            return float(valid_scores[key])
+    # If metric was set to RMSE instead, square it to get MSE
+    for key in ("rmse", "root_mean_squared_error", "l2_root"):
+        if key in valid_scores:
+            return float(valid_scores[key]) ** 2
+    logger.warning(
+        "[ModelTools] Could not find MSE/RMSE in LightGBM best_score. "
+        "Available keys: %s", list(valid_scores.keys())
+    )
+    return float("nan")
+
+
 class ModelTools:
     """
     Static utility methods for model training, hyperparameter optimisation,
@@ -132,7 +163,11 @@ class ModelTools:
         verbose_eval      = params.pop("verbose", -1)
 
         params.setdefault("objective",  "regression")
-        params.setdefault("metric",     "mse")
+        # Use 'l2' explicitly — NOT 'mse'.  LightGBM maps 'mse' -> 'l2' internally,
+        # but booster.best_score always stores the result under the key 'l2'.
+        # Specifying metric='mse' and then querying best_score['valid_0']['mse']
+        # returns None, which is the root cause of the NaN log line.
+        params.setdefault("metric",     "l2")
         params.setdefault("verbosity",  -1)
         params.setdefault("seed",       42)
 
@@ -160,10 +195,11 @@ class ModelTools:
         elapsed = time.perf_counter() - t0
 
         best_iter = booster.best_iteration
-        best_score = booster.best_score.get("valid_0", {}).get("mse", None)
+        best_mse  = _lgb_val_mse(booster)
+        best_rmse = math.sqrt(best_mse) if not math.isnan(best_mse) else float("nan")
         logger.info(
-            "[ModelTools] LightGBM trained: best_iter=%d, val_mse=%.4f, time=%.1fs",
-            best_iter, best_score or float("nan"), elapsed,
+            "[ModelTools] LightGBM trained: best_iter=%d, val_mse=%.4f, val_rmse=%.4f, time=%.1fs",
+            best_iter, best_mse, best_rmse, elapsed,
         )
         return booster
 
@@ -204,7 +240,7 @@ class ModelTools:
         n_estimators   = int(params.pop("n_estimators",      1000))
         early_stopping = int(params.pop("early_stopping_rounds", 50))
 
-        params.setdefault("objective",  "reg:squarederror")
+        params.setdefault("objective",   "reg:squarederror")
         params.setdefault("eval_metric", "rmse")
         params.setdefault("seed",        42)
         params.setdefault("verbosity",   0)
@@ -234,9 +270,10 @@ class ModelTools:
         best_iter  = booster.best_iteration
         val_scores = evals_result.get("val", {}).get("rmse", [])
         best_rmse  = min(val_scores) if val_scores else float("nan")
+        best_mse   = best_rmse ** 2 if not math.isnan(best_rmse) else float("nan")
         logger.info(
-            "[ModelTools] XGBoost trained: best_iter=%d, val_rmse=%.4f, time=%.1fs",
-            best_iter, best_rmse, elapsed,
+            "[ModelTools] XGBoost trained: best_iter=%d, val_rmse=%.4f, val_mse=%.4f, time=%.1fs",
+            best_iter, best_rmse, best_mse, elapsed,
         )
         return booster
 
@@ -299,9 +336,11 @@ class ModelTools:
         )
         elapsed = time.perf_counter() - t0
 
-        best_score = model.get_best_score().get("validation", {}).get("RMSE", float("nan"))
+        best_rmse = model.get_best_score().get("validation", {}).get("RMSE", float("nan"))
+        best_mse  = best_rmse ** 2 if not math.isnan(best_rmse) else float("nan")
         logger.info(
-            "[ModelTools] CatBoost trained: val_rmse=%.4f, time=%.1fs", best_score, elapsed
+            "[ModelTools] CatBoost trained: val_rmse=%.4f, val_mse=%.4f, time=%.1fs",
+            best_rmse, best_mse, elapsed,
         )
         return model
 
