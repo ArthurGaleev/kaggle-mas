@@ -436,47 +436,31 @@ Respond with JSON only.
 
     @staticmethod
     def _build_submission(
-        test_ids: pd.Series,
         test_ensemble: np.ndarray,
     ) -> pd.DataFrame:
         """
-        Build a submission DataFrame with columns ``[index, prediction]``,
-        deduplicated and sorted by ``index`` ascending.
+        Build a submission DataFrame with columns ``[index, prediction]``.
 
-        Duplicate IDs can arise when the test set is assembled from multiple
-        DataFrames or when ``test_ids`` is reset-indexed more than once.
-        We keep the **last** occurrence so the row stays aligned with the
-        corresponding position in ``test_ensemble``.
+        The ``index`` column is a simple integer range from 0 to
+        ``len(test_ensemble) - 1``, matching the row order of the test set.
+        No deduplication or sorting is performed.
 
         Parameters
         ----------
-        test_ids:
-            Series of row identifiers (any hashable dtype).
         test_ensemble:
-            Array of ensemble predictions, same length as ``test_ids``.
+            Array of ensemble predictions for the test set.
 
         Returns
         -------
         pd.DataFrame
-            Columns: ``index`` (row ID), ``prediction`` (float).
-            Sorted by ``index`` ascending, one row per unique ID.
+            Columns: ``index`` (0-based integer), ``prediction`` (float).
         """
-        submission = pd.DataFrame(
-            {"index": test_ids.values, "prediction": test_ensemble}
+        return pd.DataFrame(
+            {
+                "index": np.arange(len(test_ensemble)),
+                "prediction": test_ensemble,
+            }
         )
-
-        # Detect and warn about duplicate IDs before dropping
-        n_dups = submission.duplicated(subset="index").sum()
-        if n_dups > 0:
-            _logger.warning(
-                "[ModelAgent] %d duplicate index values found in test_ids — "
-                "keeping last occurrence for each ID.",
-                n_dups,
-            )
-            submission = submission.drop_duplicates(subset="index", keep="last")
-
-        submission = submission.sort_values("index").reset_index(drop=True)
-        return submission
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -550,13 +534,13 @@ Respond with JSON only.
         self._log(f"Ensemble OOF MSE={ensemble_mse:.4f}")
 
         # --- Submission ---
-        # Columns: index, prediction — sorted by index — no duplicate IDs
-        submission = self._build_submission(test_ids, test_ensemble)
+        # Columns: index (0..N-1), prediction — row order matches test set
+        submission = self._build_submission(test_ensemble)
         output_dir = Path(self.cfg.get("output_dir", "output"))
         output_dir.mkdir(parents=True, exist_ok=True)
         sub_path = output_dir / "submission.csv"
         submission.to_csv(sub_path, index=False)
-        self._log(f"Submission saved to {sub_path} ({len(submission)} rows)")
+        self._log(f"Submission saved to {sub_path}")
 
         # --- Store in state ---
         state["models"] = {a: r["models"] for a, r in oof_results.items()}
