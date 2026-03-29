@@ -452,7 +452,7 @@ Respond with JSON only.
         test: pd.DataFrame,
         columns: Optional[List[str]] = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Ordinal label encoding (fit on combined to avoid unseen categories)."""
+        """Ordinal label encoding (fit on train only; unseen test categories get -1)."""
         if columns is None:
             columns = ["type_house", "location_cluster"]
 
@@ -460,13 +460,13 @@ Respond with JSON only.
             if col not in train.columns:
                 continue
             le = LabelEncoder()
-            combined = pd.concat(
-                [train[col].astype(str), test[col].astype(str)],
-                ignore_index=True,
-            )
-            le.fit(combined)
+            le.fit(train[col].astype(str))
+            known = set(le.classes_)
             train[f"le_{col}"] = le.transform(train[col].astype(str))
-            test[f"le_{col}"] = le.transform(test[col].astype(str))
+            test_vals = test[col].astype(str)
+            test[f"le_{col}"] = test_vals.apply(
+                lambda x: le.transform([x])[0] if x in known else -1
+            )
 
         return train, test
 
