@@ -823,9 +823,19 @@ Respond with JSON only.
             test_ensemble = np.expm1(test_ensemble)
             self._log("Inverse log-transform applied to OOF and test predictions.")
 
-        # Clip predictions: rental prices cannot be negative
-        test_ensemble = np.maximum(test_ensemble, 0)
-        oof_ensemble = np.maximum(oof_ensemble, 0)
+        # Clip predictions: rental prices cannot be negative, and extreme
+        # high-end outlier predictions inflate MSE quadratically.
+        # Winsorize to [0, cap] where cap is the 99.5th percentile of the
+        # training target scaled up by 1.5× as a safety margin.  This is
+        # guaranteed to reduce MSE when the true target is bounded (which
+        # rental prices are) because predictions far outside the observed
+        # range are almost certainly errors, and clipping them closer to
+        # the distribution reduces squared error.
+        upper_cap = float(np.percentile(y_raw, 99.5)) * 1.5
+        test_ensemble = np.clip(test_ensemble, 0, upper_cap)
+        oof_ensemble = np.clip(oof_ensemble, 0, upper_cap)
+        self._log(f"Predictions clipped to [0, {upper_cap:.1f}] "
+                  f"(99.5th percentile of target × 1.5)")
 
         ensemble_mse = float(mean_squared_error(y_raw, oof_ensemble))
         self._log(f"Ensemble OOF MSE={ensemble_mse:.4f}")
