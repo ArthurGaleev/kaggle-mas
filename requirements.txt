@@ -33,3 +33,11 @@ psutil>=5.9.0
 tqdm>=4.65.0
 python-dotenv>=1.0.0
 kaggle>=1.6.0
+
+# Local large model inference (Kaggle 2×T4, provider="local")
+# Enables: Llama-3.3-70B-Instruct, Qwen3-80B-A3B-Instruct, Qwen2.5-72B-Instruct
+# Install in Kaggle notebook with:
+#   !pip install -q transformers>=4.40.0 accelerate>=0.30.0 bitsandbytes>=0.43.0
+transformers>=4.40.0
+accelerate>=0.30.0
+bitsandbytes>=0.43.0

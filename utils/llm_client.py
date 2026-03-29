@@ -1,8 +1,10 @@
 """
 Unified LLM client for the Kaggle MAS pipeline.
 
-Supports Groq, HuggingFace Inference, and OpenRouter via the OpenAI-compatible
-API.  A single :class:`LLMClient` instance wraps all provider differences,
+Supports Groq, HuggingFace Inference, OpenRouter (remote, via OpenAI-compatible
+API), and local HuggingFace model loading (provider="local").
+
+A single :class:`LLMClient` instance wraps all provider differences,
 implements retry logic with exponential back-off, optional structured JSON output,
 token usage tracking, and automatic fallback to a secondary model.
 
@@ -23,6 +25,14 @@ Usage::
         prompt="Return a JSON with keys 'summary' and 'n_rows'.",
         response_format={"type": "json_object"},
     )
+
+Providers
+---------
+- ``groq``         — fastest remote inference (default)
+- ``huggingface``  — HuggingFace Inference API (serverless)
+- ``openrouter``   — unified gateway to many remote models
+- ``local``        — load model locally with 4-bit NF4 + 2×GPU splitting
+                     (for Kaggle 2×T4; see configs/llm/local_hf.yaml)
 """
 
 from __future__ import annotations
@@ -107,12 +117,18 @@ def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
 
 class LLMClient:
     """
-    Thread-safe, config-driven LLM client supporting multiple free API providers.
+    Thread-safe, config-driven LLM client supporting multiple providers.
 
-    Providers supported (all via OpenAI-compatible API):
-    - **Groq** — fastest inference, great for development
-    - **HuggingFace Inference** — serverless inference API
-    - **OpenRouter** — unified gateway to many models
+    Remote providers (all via OpenAI-compatible API):
+    - **Groq**        — fastest inference, great for development
+    - **HuggingFace** — serverless inference API
+    - **OpenRouter**  — unified gateway to many models
+
+    Local provider:
+    - **local** — loads the model directly on Kaggle's 2×T4 GPUs using
+      ``transformers`` + ``bitsandbytes`` 4-bit NF4 quantization and
+      HuggingFace Accelerate's ``device_map="auto"`` for automatic multi-GPU
+      layer splitting.  See :class:`~utils.local_llm_client.LocalLLMClient`.
 
     Args:
         cfg:            Hydra/OmegaConf config object.  Must contain an ``llm``
@@ -120,16 +136,22 @@ class LLMClient:
                         ``base_url``, and ``api_key_env`` keys.
         token_tracker:  :class:`~utils.logger.TokenTracker` instance.
                         Defaults to the global tracker.
-        max_retries:    Maximum number of attempts before giving up.
-        base_delay:     Initial wait between retries in seconds.
+        max_retries:    Maximum number of attempts before giving up (remote only).
+        base_delay:     Initial wait between retries in seconds (remote only).
         backoff_factor: Multiplier applied to the delay after each retry.
         max_delay:      Upper bound on the retry delay in seconds.
 
     Example::
 
+        # Remote (Groq, default)
         cfg = OmegaConf.load("configs/config.yaml")
         client = LLMClient(cfg)
         answer = client.generate("What is the MSE metric?")
+
+        # Local large model on 2xT4
+        # python main.py llm=local_hf
+        # python main.py llm=local_hf llm.model=meta-llama/Llama-3.3-70B-Instruct
+        # python main.py llm=local_hf llm.model=Qwen/Qwen3-80B-A3B-Instruct
     """
 
     def __init__(
@@ -158,27 +180,6 @@ class LLMClient:
         self.max_tokens:      int = int(_cfg_get(llm_cfg, "max_tokens", 4096))
 
         # ------------------------------------------------------------------
-        # API key (read from env)
-        # ------------------------------------------------------------------
-        self.api_key: str = _get_api_key(api_key_env)
-
-        # ------------------------------------------------------------------
-        # OpenAI client (all providers share the same interface)
-        # ------------------------------------------------------------------
-        self._client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url,
-        )
-
-        # ------------------------------------------------------------------
-        # Retry settings
-        # ------------------------------------------------------------------
-        self._max_retries    = max_retries
-        self._base_delay     = base_delay
-        self._backoff_factor = backoff_factor
-        self._max_delay      = max_delay
-
-        # ------------------------------------------------------------------
         # Token tracking
         # ------------------------------------------------------------------
         self._token_tracker  = token_tracker or global_token_tracker
@@ -188,6 +189,60 @@ class LLMClient:
         # ------------------------------------------------------------------
         self._current_agent: str = "unknown"
         self._current_phase: str = "unknown"
+
+        # Retry settings (used only for remote providers)
+        self._max_retries    = max_retries
+        self._base_delay     = base_delay
+        self._backoff_factor = backoff_factor
+        self._max_delay      = max_delay
+
+        # ------------------------------------------------------------------
+        # LOCAL provider — delegate everything to LocalLLMClient
+        # Loads model weights onto Kaggle's 2×T4 GPUs via Accelerate +
+        # bitsandbytes 4-bit NF4 quantization.
+        # ------------------------------------------------------------------
+        self._local_client: Optional[Any] = None
+        if self.provider == "local":
+            from utils.local_llm_client import LocalLLMClient
+
+            local_cfg = _cfg_get(llm_cfg, "local", {})
+
+            # HF token: read from the configured env var (same as remote providers)
+            hf_token = os.environ.get(api_key_env, "").strip() or None
+
+            self._local_client = LocalLLMClient(
+                model_name             = self.model,
+                hf_token               = hf_token,
+                load_in_4bit           = bool(_cfg_get(local_cfg, "load_in_4bit",              True)),
+                bnb_4bit_compute_dtype = str( _cfg_get(local_cfg, "bnb_4bit_compute_dtype",   "float16")),
+                bnb_4bit_use_double_quant = bool(_cfg_get(local_cfg, "bnb_4bit_use_double_quant", True)),
+                bnb_4bit_quant_type    = str( _cfg_get(local_cfg, "bnb_4bit_quant_type",      "nf4")),
+                device_map             = str( _cfg_get(local_cfg, "device_map",               "auto")),
+                max_memory_per_gpu     = str( _cfg_get(local_cfg, "max_memory_per_gpu",       "14GiB")),
+                use_flash_attention    = bool(_cfg_get(local_cfg, "use_flash_attention",       False)),
+                temperature            = self.temperature,
+                max_new_tokens         = self.max_tokens,
+                do_sample              = bool(_cfg_get(local_cfg, "do_sample",                 True)),
+                top_p                  = float(_cfg_get(local_cfg, "top_p",                    0.9)),
+                repetition_penalty     = float(_cfg_get(local_cfg, "repetition_penalty",       1.1)),
+            )
+            _log.info(
+                "LLMClient initialised | provider=local model=%s (LocalLLMClient)",
+                self.model,
+            )
+            # Skip OpenAI client setup entirely for local provider
+            self._client = None  # type: ignore[assignment]
+            self.api_key = ""    # not used
+            return
+
+        # ------------------------------------------------------------------
+        # REMOTE providers — OpenAI-compatible API
+        # ------------------------------------------------------------------
+        self.api_key: str = _get_api_key(api_key_env)
+        self._client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+        )
 
         _log.info(
             "LLMClient initialised | provider=%s model=%s base_url=%s",
@@ -228,42 +283,52 @@ class LLMClient:
         """
         Generate a text (or structured JSON) response from the configured LLM.
 
+        For the ``local`` provider, delegates directly to
+        :class:`~utils.local_llm_client.LocalLLMClient`.  Note that local
+        models do not support ``response_format`` — if structured JSON output
+        is needed, rely on prompt engineering instead.
+
         Args:
             prompt:          User message / instruction.
             system_prompt:   Optional system message prepended to the conversation.
             temperature:     Override the default temperature from config.
             max_tokens:      Override the default max_tokens from config.
-            response_format: Optional format specifier.  Pass
-                             ``{"type": "json_object"}`` to request structured
-                             JSON output (provider must support it).
+            response_format: Optional format specifier (remote providers only).
+                             Pass ``{"type": "json_object"}`` to request structured
+                             JSON output.  Silently ignored for ``local`` provider.
             agent:           Override the agent name for token tracking.
             phase:           Override the phase name for token tracking.
 
         Returns:
-            The model's text response as a string.  For JSON requests this will
-            be a raw JSON string — pass it through
-            :func:`~utils.helpers.safe_json_parse` to obtain a Python object.
+            The model's text response as a string.
 
         Raises:
             RuntimeError: If all retry attempts (including fallback) fail.
-
-        Example::
-
-            # Plain text
-            answer = client.generate("Summarise this dataset.")
-
-            # Structured JSON
-            raw_json = client.generate(
-                "List the top 3 most predictive features as JSON.",
-                response_format={"type": "json_object"},
-            )
-            data = safe_json_parse(raw_json)
         """
         _agent = agent or self._current_agent
         _phase = phase or self._current_phase
         _temp  = temperature if temperature is not None else self.temperature
         _toks  = max_tokens  if max_tokens  is not None else self.max_tokens
 
+        # ------------------------------------------------------------------
+        # Local provider path
+        # ------------------------------------------------------------------
+        if self._local_client is not None:
+            if response_format is not None:
+                _log.debug(
+                    "[LocalLLM] response_format is not supported for local provider — "
+                    "relying on prompt engineering for structured output."
+                )
+            return self._local_client.generate(
+                prompt,
+                system_prompt=system_prompt,
+                temperature=_temp,
+                max_tokens=_toks,
+            )
+
+        # ------------------------------------------------------------------
+        # Remote provider path (Groq / HuggingFace API / OpenRouter)
+        # ------------------------------------------------------------------
         messages = self._build_messages(prompt, system_prompt)
 
         # First attempt with primary model, then fallback
@@ -297,7 +362,7 @@ class LLMClient:
         raise RuntimeError("LLMClient: unexpected state after model attempts.")
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal helpers (remote only)
     # ------------------------------------------------------------------
 
     def _build_messages(
@@ -352,8 +417,6 @@ class LLMClient:
                     "max_tokens":  max_tokens,
                 }
                 if response_format is not None:
-                    # Not all providers / models support json_object mode.
-                    # We pass it through and let the provider raise if unsupported.
                     kwargs["response_format"] = response_format
 
                 t0 = time.perf_counter()
@@ -402,7 +465,6 @@ class LLMClient:
                 delay = min(delay * self._backoff_factor, self._max_delay)
 
             except APIError as exc:
-                # Non-retryable API error (e.g. bad request / auth failure)
                 _log.error(
                     "LLM non-retryable APIError on attempt %d (model=%s): %s",
                     attempt, model, exc,
@@ -432,8 +494,13 @@ class LLMClient:
         """
         Generate a response and automatically parse it as JSON.
 
-        Requests structured JSON output from the provider (``json_object`` mode)
-        and passes the raw text through :func:`~utils.helpers.safe_json_parse`.
+        Requests structured JSON output from the provider (``json_object`` mode
+        for remote providers) and passes the raw text through
+        :func:`~utils.helpers.safe_json_parse`.
+
+        For the ``local`` provider, ``json_object`` mode is not supported by
+        the model backend — the prompt itself should instruct the model to
+        respond with JSON, and this method will still attempt to parse the output.
 
         Args:
             prompt:       User instruction.
@@ -445,22 +512,18 @@ class LLMClient:
 
         Returns:
             Parsed Python object (dict, list, etc.), or ``None`` on parse failure.
-
-        Example::
-
-            features = client.generate_json(
-                "List 5 feature engineering ideas as a JSON array.",
-                system_prompt="You are a feature engineer.",
-            )
         """
         from utils.helpers import safe_json_parse  # local import avoids circularity
+
+        # For local provider we skip response_format (not supported)
+        fmt = None if self._local_client is not None else {"type": "json_object"}
 
         raw = self.generate(
             prompt,
             system_prompt=system_prompt,
             temperature=temperature,
             max_tokens=max_tokens,
-            response_format={"type": "json_object"},
+            response_format=fmt,
             agent=agent,
             phase=phase,
         )
@@ -477,6 +540,8 @@ class LLMClient:
     # ------------------------------------------------------------------
 
     def __repr__(self) -> str:
+        if self._local_client is not None:
+            return f"LLMClient(provider=local, model={self.model!r}, client={self._local_client!r})"
         return (
             f"LLMClient(provider={self.provider!r}, model={self.model!r}, "
             f"fallback={self.fallback_model!r}, base_url={self.base_url!r})"
