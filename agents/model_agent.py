@@ -5,11 +5,15 @@ plan, optimises with Optuna, and creates a weighted ensemble.
 The LLM is consulted only to reason about which models to enable and which
 parameter search-space adjustments are appropriate for the dataset size and
 type. All training and tuning code is deterministic Python.
+
+GPU handling is centralised in ``tools.model_tools.ModelTools``:
+  - ``gpu_available()``  — cached CUDA probe + OpenCL ICD setup for LightGBM
+  - ``ModelTools.train_lightgbm/xgboost/catboost`` — inject the correct
+    device/tree_method/task_type param and fall back to CPU transparently.
 """
 
 import gc
-import json
-import os
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,7 +27,10 @@ from sklearn.model_selection import KFold
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 from agents.base import BaseAgent
+from tools.model_tools import ModelTools, gpu_available
 from utils.helpers import safe_json_parse
+
+_logger = logging.getLogger("kaggle-mas.model_agent")
 
 
 class ModelAgent(BaseAgent):
@@ -42,7 +49,7 @@ class ModelAgent(BaseAgent):
     State keys produced:
         models          (dict):          trained model objects per fold per algorithm.
         oof_predictions (dict):          out-of-fold predictions per algorithm.
-        cv_scores       (dict):          per-fold MSE scores per algorithm.
+        cv_scores       (dict):          per-fold metrics by model name.
         feature_importances (dict):      mean feature importance per algorithm.
         ensemble_weights (dict):         weights used for ensemble.
         ensemble_oof    (np.ndarray):    ensemble OOF predictions.
@@ -80,13 +87,14 @@ price regression task (Kaggle, MSE metric).
 {improvement_hints or "None — this is the first training run."}
 
 ## Available models
-- lightgbm:  fast, memory-efficient, good default choice
-- xgboost:   solid alternative; use tree_method='hist' for speed
-- catboost:  strong with categoricals; slower but accurate
+- lightgbm:  fast, GPU-accelerated (device='gpu'), memory-efficient
+- xgboost:   GPU-accelerated via device='cuda' (XGBoost >=2.0) or tree_method='gpu_hist' (older)
+- catboost:  strong with categoricals; GPU via task_type='GPU'
 
 ## Instructions
 Decide which models to enable, how many Optuna trials to run (≤ 30 for notebook
 constraints), and what param ranges to search.  Keep it practical.
+Always include the GPU acceleration parameter for each enabled model.
 
 Return strict JSON only:
 {{
@@ -96,6 +104,7 @@ Return strict JSON only:
       "n_trials": 20,
       "fixed_params": {{
         "verbosity": -1,
+        "device": "gpu",
         "n_estimators": 1000,
         "early_stopping_rounds": 50
       }},
@@ -113,7 +122,7 @@ Return strict JSON only:
       "enabled": true,
       "n_trials": 15,
       "fixed_params": {{
-        "tree_method": "hist",
+        "device": "cuda",
         "n_estimators": 1000,
         "early_stopping_rounds": 50,
         "verbosity": 0
@@ -133,6 +142,7 @@ Return strict JSON only:
       "fixed_params": {{
         "iterations": 1000,
         "early_stopping_rounds": 50,
+        "task_type": "GPU",
         "verbose": 0
       }},
       "search_space": {{
@@ -153,7 +163,12 @@ Respond with JSON only.
                 "lightgbm": {
                     "enabled": True,
                     "n_trials": 20,
-                    "fixed_params": {"verbosity": -1, "n_estimators": 1000, "early_stopping_rounds": 50},
+                    "fixed_params": {
+                        "verbosity": -1,
+                        "device": "gpu",
+                        "n_estimators": 1000,
+                        "early_stopping_rounds": 50,
+                    },
                     "search_space": {
                         "num_leaves":        {"type": "int",   "low": 31,   "high": 255},
                         "learning_rate":     {"type": "float", "low": 0.01, "high": 0.3,  "log": True},
@@ -166,8 +181,12 @@ Respond with JSON only.
                 "xgboost": {
                     "enabled": True,
                     "n_trials": 15,
-                    "fixed_params": {"tree_method": "hist", "n_estimators": 1000,
-                                     "early_stopping_rounds": 50, "verbosity": 0},
+                    "fixed_params": {
+                        "device": "cuda",
+                        "n_estimators": 1000,
+                        "early_stopping_rounds": 50,
+                        "verbosity": 0,
+                    },
                     "search_space": {
                         "max_depth":        {"type": "int",   "low": 3,    "high": 12},
                         "learning_rate":    {"type": "float", "low": 0.01, "high": 0.3,  "log": True},
@@ -206,7 +225,7 @@ Respond with JSON only.
         return params
 
     # ------------------------------------------------------------------
-    # Model training helpers
+    # Model training helpers — delegate to ModelTools for GPU + training
     # ------------------------------------------------------------------
 
     def _train_lightgbm(
@@ -218,30 +237,13 @@ Respond with JSON only.
         params: Dict[str, Any],
         fixed: Dict[str, Any],
     ) -> Tuple[Any, float]:
-        import lightgbm as lgb
-
+        # Merge: fixed params first, then Optuna trial params on top.
+        # ModelTools.train_lightgbm will inject device='gpu' if GPU is available
+        # and 'device' is not already present in the merged dict.
         merged = {**fixed, **params}
-        n_est = merged.pop("n_estimators", 1000)
-        es = merged.pop("early_stopping_rounds", 50)
-
-        dtrain = lgb.Dataset(X_train, label=y_train)
-        dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
-
-        callbacks = [
-            lgb.early_stopping(stopping_rounds=es, verbose=False),
-            lgb.log_evaluation(period=-1),
-        ]
-        merged["metric"] = "mse"
-        model = lgb.train(
-            merged,
-            dtrain,
-            num_boost_round=n_est,
-            valid_sets=[dval],
-            callbacks=callbacks,
-        )
+        model = ModelTools.train_lightgbm(X_train, y_train, X_val, y_val, merged)
         val_pred = model.predict(X_val)
-        val_mse = mean_squared_error(y_val, val_pred)
-        return model, val_mse
+        return model, float(mean_squared_error(y_val, val_pred))
 
     def _train_xgboost(
         self,
@@ -252,22 +254,13 @@ Respond with JSON only.
         params: Dict[str, Any],
         fixed: Dict[str, Any],
     ) -> Tuple[Any, float]:
-        import xgboost as xgb
-
+        # ModelTools.train_xgboost injects device='cuda' (or tree_method='gpu_hist'
+        # for XGBoost <2.0) when GPU is available and neither key is already present.
         merged = {**fixed, **params}
-        n_est = merged.pop("n_estimators", 1000)
-        es = merged.pop("early_stopping_rounds", 50)
-
-        merged["eval_metric"] = "rmse"
-        model = xgb.XGBRegressor(n_estimators=n_est, early_stopping_rounds=es, **merged)
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            verbose=False,
-        )
-        val_pred = model.predict(X_val)
-        val_mse = mean_squared_error(y_val, val_pred)
-        return model, val_mse
+        booster = ModelTools.train_xgboost(X_train, y_train, X_val, y_val, merged)
+        import xgboost as xgb
+        val_pred = booster.predict(xgb.DMatrix(X_val))
+        return booster, float(mean_squared_error(y_val, val_pred))
 
     def _train_catboost(
         self,
@@ -278,19 +271,12 @@ Respond with JSON only.
         params: Dict[str, Any],
         fixed: Dict[str, Any],
     ) -> Tuple[Any, float]:
-        from catboost import CatBoostRegressor, Pool
-
+        # ModelTools.train_catboost injects task_type='GPU' when GPU is available
+        # and 'task_type' is not already set.
         merged = {**fixed, **params}
-        model = CatBoostRegressor(**merged)
-        model.fit(
-            X_train, y_train,
-            eval_set=(X_val, y_val),
-            use_best_model=True,
-            verbose=False,
-        )
-        val_pred = model.predict(X_val)
-        val_mse = mean_squared_error(y_val, val_pred)
-        return model, val_mse
+        model = ModelTools.train_catboost(X_train, y_train, X_val, y_val, merged)
+        val_pred = np.asarray(model.predict(X_val))
+        return model, float(mean_squared_error(y_val, val_pred))
 
     # ------------------------------------------------------------------
     # Optuna tuning per algorithm
@@ -468,6 +454,9 @@ Respond with JSON only.
         X_test: np.ndarray = state["test_feat"].values.astype(np.float32)
         test_ids: pd.Series = state["test_ids"]
         feature_names: List[str] = state["feature_names"]
+
+        # Log GPU status once at the start (uses cached check from ModelTools)
+        _logger.info("[GPU] GPU available: %s", gpu_available())
 
         # --- LLM plan ---
         plan = self._request_model_plan(state)

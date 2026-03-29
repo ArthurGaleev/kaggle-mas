@@ -34,6 +34,7 @@ models:
       reg_lambda: 0.1
       min_child_samples: 20
       early_stopping_rounds: 50
+      device: gpu           # GPU acceleration; ModelAgent falls back to cpu if no GPU
   xgboost:
     enabled: true
     params:
@@ -45,6 +46,7 @@ models:
       reg_alpha: 0.1
       reg_lambda: 0.1
       early_stopping_rounds: 50
+      device: cuda          # XGBoost >=2.0 GPU; ModelAgent selects gpu_hist for older versions
   catboost:
     enabled: true
     params:
@@ -54,6 +56,7 @@ models:
       l2_leaf_reg: 3
       early_stopping_rounds: 50
       verbose: 100
+      task_type: GPU        # GPU acceleration; ModelAgent falls back to CPU if no GPU
 
 guardrails:
   max_input_rows: 500000
