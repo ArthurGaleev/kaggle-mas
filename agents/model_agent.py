@@ -609,6 +609,7 @@ Respond with JSON only.
         if len(algos) >= 2:
             try:
                 from sklearn.linear_model import RidgeCV
+                from sklearn.model_selection import cross_val_predict, KFold
 
                 oof_matrix = np.column_stack(
                     [oof_results[a]["oof_predictions"] for a in algos]
@@ -618,8 +619,20 @@ Respond with JSON only.
                 )
 
                 meta = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0])
+
+                # Use cross_val_predict for OOF ensemble to avoid leakage.
+                # Fitting RidgeCV on oof_matrix and predicting on the SAME
+                # oof_matrix produces an optimistically biased OOF MSE
+                # (the meta-learner has seen all the data it predicts on).
+                # cross_val_predict ensures each OOF prediction is made by
+                # a meta-learner that never saw that row during fitting.
+                stacking_cv = KFold(n_splits=5, shuffle=True, random_state=42)
+                oof_ensemble = cross_val_predict(
+                    meta, oof_matrix, y, cv=stacking_cv
+                )
+
+                # Fit final meta-learner on ALL OOF data for test predictions
                 meta.fit(oof_matrix, y)
-                oof_ensemble = meta.predict(oof_matrix)
                 test_ensemble = meta.predict(test_matrix)
 
                 # Report meta-learner coefficients as weights
