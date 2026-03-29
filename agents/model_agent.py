@@ -142,7 +142,8 @@ Return strict JSON only:
         "verbosity": -1,
         "device": "gpu",
         "n_estimators": 1000,
-        "early_stopping_rounds": 50
+        "early_stopping_rounds": 50,
+        "bagging_freq": 1
       }},
       "search_space": {{
         "num_leaves":        {{"type": "int",   "low": 31,  "high": 255}},
