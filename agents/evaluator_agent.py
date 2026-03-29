@@ -150,7 +150,11 @@ class EvaluatorAgent(BaseAgent):
         ensemble_oof = state["ensemble_oof"].astype(np.float64)
         feat_importances = state.get("feature_importances", {})
         models_dict = state.get("models", {})
-        X_train = state["train_feat"].values.astype(np.float32)
+        # Filter to numeric columns only — train_feat may contain object-dtype
+        # TE placeholder columns that cannot be cast to float32.
+        numeric_cols = [c for c in state["train_feat"].columns
+                        if state["train_feat"][c].dtype != 'object']
+        X_train = state["train_feat"][numeric_cols].values.astype(np.float32)
         feature_names = state.get("feature_names", [])
 
         report: Dict[str, Any] = {"per_algorithm": {}, "ensemble": {}, "feature_analysis": {}}
@@ -163,7 +167,13 @@ class EvaluatorAgent(BaseAgent):
             residuals = self._residual_analysis(y, oof_arr)
 
             algo_models = models_dict.get(algo, [])
-            overfit = self._overfitting_check(algo, algo_models, X_train, y, metrics["mse"])
+            # Overfitting check may fail if the model was trained with TE-augmented
+            # features (more columns) than the raw X_train has. Degrade gracefully.
+            try:
+                overfit = self._overfitting_check(algo, algo_models, X_train, y, metrics["mse"])
+            except Exception as exc:
+                self._log(f"Overfitting check failed for {algo}: {exc}", level="warning")
+                overfit = {"error": str(exc)}
 
             top_feats = (
                 self._top_features(feat_importances.get(algo, {}), self.TOP_K_FEATURES)
