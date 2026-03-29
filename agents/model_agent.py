@@ -570,6 +570,19 @@ Respond with JSON only.
                 importances.append(model.feature_importances_)
             elif hasattr(model, "feature_importance"):
                 importances.append(model.feature_importance())
+            elif hasattr(model, "get_score"):
+                # XGBoost Booster: get_score() returns {f0: val, ...}
+                score = model.get_score(importance_type="gain")
+                imp_arr = np.zeros(len(fold_feat_names))
+                for fname, val in score.items():
+                    # Feature names are f0, f1, ... by default
+                    try:
+                        idx = int(fname.replace("f", ""))
+                        if idx < len(imp_arr):
+                            imp_arr[idx] = val
+                    except (ValueError, IndexError):
+                        pass
+                importances.append(imp_arr)
 
             self._log(f"[{algo}] Fold {fold_idx+1}/{n_splits} MSE={fold_mse:.4f}")
 
