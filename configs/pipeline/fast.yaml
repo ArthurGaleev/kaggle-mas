@@ -1,0 +1,21 @@
+phases:
+  - name: "data_profiling"
+    agent: "DataAgent"
+    timeout: 60
+    retries: 1
+  - name: "data_cleaning"
+    agent: "DataAgent"
+    timeout: 60
+    retries: 1
+  - name: "feature_engineering"
+    agent: "FeatureAgent"
+    timeout: 120
+    retries: 1
+  - name: "model_training"
+    agent: "ModelAgent"
+    timeout: 300
+    retries: 1
+  - name: "evaluation"
+    agent: "EvaluatorAgent"
+    timeout: 120
+    retries: 1

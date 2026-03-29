@@ -1,0 +1,102 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+*.pyo
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ── Project-specific ─────────────────────────────────────────────────────────
+# Data directory (keep gitignored — use Kaggle API / gdown to fetch)
+data/
+!data/.gitkeep
+
+# Outputs & logs
+outputs/
+logs/
+*.jsonl
+
+# CSV files (except the sample submission template)
+*.csv
+!data/sample_submission.csv
+
+# Model checkpoints / weights
+*.pkl
+*.pickle
+*.joblib
+*.cbm
+*.bin
+*.pt
+*.pth
+*.h5
+*.onnx
+
+# Optuna study databases
+*.db
+optuna_study_*.db
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+.env
+*.env
+.env.*
+!.env.example
+
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+
+# ── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Testing & coverage ───────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# ── Type checking ─────────────────────────────────────────────────────────────
+.mypy_cache/
+.pytype/
+.dmypy.json
+dmypy.json
+
+# ── Hydra outputs ─────────────────────────────────────────────────────────────
+multirun/
+.hydra/

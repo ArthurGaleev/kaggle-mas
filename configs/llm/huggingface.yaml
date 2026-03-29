@@ -1,0 +1,7 @@
+provider: "huggingface"
+api_key_env: "HF_TOKEN"
+model: "Qwen/Qwen2.5-72B-Instruct"
+base_url: "https://api-inference.huggingface.co/v1"
+temperature: 0.1
+max_tokens: 4096
+fallback_model: "Qwen/Qwen2.5-7B-Instruct"

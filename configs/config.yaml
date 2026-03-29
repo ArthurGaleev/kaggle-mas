@@ -1,0 +1,82 @@
+defaults:
+  - _self_
+  - llm: groq
+  - pipeline: default
+
+project:
+  name: "kaggle-mas-rental"
+  seed: 42
+  data_dir: "./data"
+  output_dir: "./outputs"
+  log_dir: "./logs"
+  competition: "mws-ai-agents-2026"
+
+pipeline:
+  max_feedback_loops: 3
+  target_mse_threshold: 1500.0
+  cv_folds: 5
+  test_size: 0.2
+  enable_rag: true
+  enable_guardrails: true
+  enable_monitoring: true
+
+models:
+  lightgbm:
+    enabled: true
+    params:
+      n_estimators: 1000
+      learning_rate: 0.05
+      max_depth: 7
+      num_leaves: 63
+      subsample: 0.8
+      colsample_bytree: 0.8
+      reg_alpha: 0.1
+      reg_lambda: 0.1
+      min_child_samples: 20
+      early_stopping_rounds: 50
+  xgboost:
+    enabled: true
+    params:
+      n_estimators: 1000
+      learning_rate: 0.05
+      max_depth: 7
+      subsample: 0.8
+      colsample_bytree: 0.8
+      reg_alpha: 0.1
+      reg_lambda: 0.1
+      early_stopping_rounds: 50
+  catboost:
+    enabled: true
+    params:
+      iterations: 1000
+      learning_rate: 0.05
+      depth: 7
+      l2_leaf_reg: 3
+      early_stopping_rounds: 50
+      verbose: 100
+
+guardrails:
+  max_input_rows: 500000
+  max_features: 200
+  max_target_value: 100000
+  min_target_value: 0
+  max_missing_ratio: 0.95
+  max_cardinality: 1000
+  allowed_dtypes: ["int64", "float64", "object", "datetime64"]
+  max_inference_time_seconds: 300
+  input_validation: true
+  output_validation: true
+
+monitoring:
+  log_level: "INFO"
+  track_token_usage: true
+  track_latency: true
+  track_memory: true
+  save_artifacts: true
+
+rag:
+  chunk_size: 512
+  chunk_overlap: 50
+  top_k: 5
+  embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  knowledge_base_path: "./rag/knowledge_base"
