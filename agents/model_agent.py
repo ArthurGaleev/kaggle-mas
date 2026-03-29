@@ -649,9 +649,19 @@ Respond with JSON only.
         """
         X_df: pd.DataFrame = state["train_feat"]   # may contain TE placeholder cols
         test_df: pd.DataFrame = state["test_feat"]
-        y: np.ndarray = state["target_series"].values.astype(np.float32)
+        y_raw: np.ndarray = state["target_series"].values.astype(np.float32)
         test_ids: pd.Series = state["test_ids"]
         feature_names: List[str] = state["feature_names"]
+
+        # Log-transform target for right-skewed rental prices.
+        # Training on log1p(target) and inverse-transforming predictions with
+        # expm1() compresses expensive outliers that inflate MSE.
+        use_log_target: bool = True
+        if use_log_target:
+            y = np.log1p(y_raw)
+            self._log("Using log1p(target) for training (will inverse-transform predictions).")
+        else:
+            y = y_raw
 
         # Read target-encoding config from feature plan
         feature_plan = state.get("feature_plan", {})
@@ -739,7 +749,14 @@ Respond with JSON only.
         oof_ensemble, test_ensemble, ensemble_weights = self._build_ensemble(
             oof_results, test_predictions, y, method=ensemble_method
         )
-        ensemble_mse = float(mean_squared_error(y, oof_ensemble))
+
+        # Inverse log-transform predictions back to original price scale
+        if use_log_target:
+            oof_ensemble = np.expm1(oof_ensemble)
+            test_ensemble = np.expm1(test_ensemble)
+            self._log("Inverse log-transform applied to OOF and test predictions.")
+
+        ensemble_mse = float(mean_squared_error(y_raw, oof_ensemble))
         self._log(f"Ensemble OOF MSE={ensemble_mse:.4f}")
 
         # --- Submission --- (saving to disk is owned by main.py)
@@ -759,5 +776,6 @@ Respond with JSON only.
         state["ensemble_test"] = test_ensemble
         state["submission_df"] = submission
         state["ensemble_cv_mse"] = ensemble_mse
+        state["use_log_target"] = use_log_target
 
         return state
