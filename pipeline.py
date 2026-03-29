@@ -563,6 +563,7 @@ def run_pipeline(cfg: DictConfig) -> Dict[str, Any]:
         submission = final_state["submission_df"]
     """
     from utils.llm_client import LLMClient
+    from utils.helpers import set_seed
     from rag.knowledge_base import KnowledgeBase
     from rag.retriever import RAGRetriever
     from guardrails.input_validator import InputValidator
@@ -571,6 +572,11 @@ def run_pipeline(cfg: DictConfig) -> Dict[str, Any]:
     from monitoring.tracker import PipelineTracker
 
     logger.info("=== Initializing Multi-Agent Pipeline ===")
+
+    # Set global random seeds for reproducibility
+    seed = int(OmegaConf.select(cfg, "project.seed", default=42))
+    set_seed(seed)
+    logger.info("Global random seed set to %d.", seed)
 
     # ------------------------------------------------------------------
     # 1. LLM Client

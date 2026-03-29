@@ -324,6 +324,38 @@ Respond with JSON only.
             state["improvement_plan"] = {}
             return state
 
+        # --- Adaptive early stop: if improvement < 1%, force ACCEPT ---
+        current_report = state.get("evaluation_report", {})
+        current_mse = current_report.get("ensemble", {}).get("oof_metrics", {}).get("mse")
+        prev_history = state.get("decision_history", [])
+        prev_mse = prev_history[-1].get("ensemble_mse") if prev_history else None
+        if (prev_mse is not None and current_mse is not None
+                and prev_mse > 0 and current_mse > 0):
+            rel_improvement = (prev_mse - current_mse) / prev_mse
+            if rel_improvement < 0.01:
+                self._log(
+                    f"Adaptive stop: improvement {rel_improvement:.4%} < 1% threshold. "
+                    "Forcing ACCEPT regardless of LLM decision."
+                )
+                state["decision"] = _ACCEPT
+                state["pipeline_complete"] = True
+                state["reasoning"] = (
+                    f"Adaptive early stop: {rel_improvement:.4%} improvement is below 1% threshold."
+                )
+                state["next_agent"] = None
+                state["improvement_plan"] = {}
+                history_entry = {
+                    "iteration": iteration,
+                    "decision": _ACCEPT,
+                    "reasoning": state["reasoning"],
+                    "next_agent": None,
+                    "ensemble_mse": current_mse,
+                }
+                prev_history.append(history_entry)
+                state["decision_history"] = prev_history
+                state["iteration"] = iteration + 1
+                return state
+
         # --- Ask LLM ---
         decision_dict = self._request_decision(state)
         decision = decision_dict.get("decision", _ACCEPT).upper()
