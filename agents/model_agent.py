@@ -441,28 +441,34 @@ Respond with JSON only.
         # validation fold, preventing optimistic bias in tuned params.
         tune_kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed + _TUNE_SEED_OFFSET)
 
+        _MAX_TUNE_FOLDS = 3  # Use at most 3 folds per trial for speed
+
         def objective(trial: optuna.Trial) -> float:
             params = self._sample_params(trial, search_space)
             try:
-                tune_train_idx, tune_val_idx = next(iter(tune_kf.split(X_df)))
-                train_fold_df = X_df.iloc[tune_train_idx].reset_index(drop=True)
-                val_fold_df = X_df.iloc[tune_val_idx].reset_index(drop=True)
-                y_t = y[tune_train_idx]
-                y_v = y[tune_val_idx]
+                fold_mses = []
+                for fold_idx, (tune_train_idx, tune_val_idx) in enumerate(tune_kf.split(X_df)):
+                    if fold_idx >= _MAX_TUNE_FOLDS:
+                        break
+                    train_fold_df = X_df.iloc[tune_train_idx].reset_index(drop=True)
+                    val_fold_df = X_df.iloc[tune_val_idx].reset_index(drop=True)
+                    y_t = y[tune_train_idx]
+                    y_v = y[tune_val_idx]
 
-                # Apply fold-level target encoding to match CV feature space
-                X_t, X_v, _, _ = self._apply_fold_target_encoding(
-                    train_df=train_fold_df,
-                    val_df=val_fold_df,
-                    test_df=val_fold_df,  # dummy, not used
-                    target_fold=y_t,
-                    global_mean=global_mean,
-                    smoothing=te_smoothing,
-                    feature_names=feature_names,
-                )
+                    # Apply fold-level target encoding to match CV feature space
+                    X_t, X_v, _, _ = self._apply_fold_target_encoding(
+                        train_df=train_fold_df,
+                        val_df=val_fold_df,
+                        test_df=val_fold_df,  # dummy, not used
+                        target_fold=y_t,
+                        global_mean=global_mean,
+                        smoothing=te_smoothing,
+                        feature_names=feature_names,
+                    )
 
-                _, mse = train_fn(X_t, y_t, X_v, y_v, params, dict(fixed))
-                return mse
+                    _, mse = train_fn(X_t, y_t, X_v, y_v, params, dict(fixed))
+                    fold_mses.append(mse)
+                return float(np.mean(fold_mses))
             except Exception as exc:
                 self._log(f"Trial failed: {exc}", level="warning")
                 return float("inf")
