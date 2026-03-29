@@ -56,7 +56,7 @@ graph TD
 
 ### One-click Google Colab
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/YOUR_USERNAME/kaggle-mas/blob/main/notebooks/run_colab.py)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ArthurGaleev/kaggle-mas/blob/master/notebooks/demo.ipynb)
 
 1. Open the notebook
 2. Set `OPENROUTER_API_KEY` (free at [openrouter.ai](https://openrouter.ai/))
