@@ -237,9 +237,6 @@ Respond with JSON only.
         params: Dict[str, Any],
         fixed: Dict[str, Any],
     ) -> Tuple[Any, float]:
-        # Merge: fixed params first, then Optuna trial params on top.
-        # ModelTools.train_lightgbm will inject device='gpu' if GPU is available
-        # and 'device' is not already present in the merged dict.
         merged = {**fixed, **params}
         model = ModelTools.train_lightgbm(X_train, y_train, X_val, y_val, merged)
         val_pred = model.predict(X_val)
@@ -254,8 +251,6 @@ Respond with JSON only.
         params: Dict[str, Any],
         fixed: Dict[str, Any],
     ) -> Tuple[Any, float]:
-        # ModelTools.train_xgboost injects device='cuda' (or tree_method='gpu_hist'
-        # for XGBoost <2.0) when GPU is available and neither key is already present.
         merged = {**fixed, **params}
         booster = ModelTools.train_xgboost(X_train, y_train, X_val, y_val, merged)
         import xgboost as xgb
@@ -271,8 +266,6 @@ Respond with JSON only.
         params: Dict[str, Any],
         fixed: Dict[str, Any],
     ) -> Tuple[Any, float]:
-        # ModelTools.train_catboost injects task_type='GPU' when GPU is available
-        # and 'task_type' is not already set.
         merged = {**fixed, **params}
         model = ModelTools.train_catboost(X_train, y_train, X_val, y_val, merged)
         val_pred = np.asarray(model.predict(X_val))
@@ -438,6 +431,54 @@ Respond with JSON only.
         return oof_ensemble, test_ensemble, weight_dict
 
     # ------------------------------------------------------------------
+    # Submission builder (extracted for clarity and testability)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_submission(
+        test_ids: pd.Series,
+        test_ensemble: np.ndarray,
+    ) -> pd.DataFrame:
+        """
+        Build a submission DataFrame with columns ``[index, prediction]``,
+        deduplicated and sorted by ``index`` ascending.
+
+        Duplicate IDs can arise when the test set is assembled from multiple
+        DataFrames or when ``test_ids`` is reset-indexed more than once.
+        We keep the **last** occurrence so the row stays aligned with the
+        corresponding position in ``test_ensemble``.
+
+        Parameters
+        ----------
+        test_ids:
+            Series of row identifiers (any hashable dtype).
+        test_ensemble:
+            Array of ensemble predictions, same length as ``test_ids``.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: ``index`` (row ID), ``prediction`` (float).
+            Sorted by ``index`` ascending, one row per unique ID.
+        """
+        submission = pd.DataFrame(
+            {"index": test_ids.values, "prediction": test_ensemble}
+        )
+
+        # Detect and warn about duplicate IDs before dropping
+        n_dups = submission.duplicated(subset="index").sum()
+        if n_dups > 0:
+            _logger.warning(
+                "[ModelAgent] %d duplicate index values found in test_ids — "
+                "keeping last occurrence for each ID.",
+                n_dups,
+            )
+            submission = submission.drop_duplicates(subset="index", keep="last")
+
+        submission = submission.sort_values("index").reset_index(drop=True)
+        return submission
+
+    # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
 
@@ -474,7 +515,7 @@ Respond with JSON only.
 
         for algo in enabled_algos:
             algo_cfg = models_cfg[algo]
-            self._log(f"Tuning {algo} with Optuna ({algo_cfg.get('n_trials', 20)} trials)…")
+            self._log(f"Tuning {algo} with Optuna ({algo_cfg.get('n_trials', 20)} trials)\u2026")
 
             try:
                 best_params = self._tune_algorithm(algo, algo_cfg, X, y, n_splits, seed)
@@ -482,7 +523,7 @@ Respond with JSON only.
                 self._log(f"Optuna tuning failed for {algo}: {exc}. Using fixed params.", level="warning")
                 best_params = {}
 
-            self._log(f"CV training {algo}…")
+            self._log(f"CV training {algo}\u2026")
             try:
                 result = self._cross_validate_algorithm(
                     algo, algo_cfg, best_params, X, y, X_test, n_splits, seed, feature_names
@@ -490,7 +531,7 @@ Respond with JSON only.
                 oof_results[algo] = result
                 test_predictions[algo] = result["test_predictions"]
                 self._log(
-                    f"[{algo}] CV MSE={result['mean_cv_mse']:.4f} ± {result['std_cv_mse']:.4f}"
+                    f"[{algo}] CV MSE={result['mean_cv_mse']:.4f} \u00b1 {result['std_cv_mse']:.4f}"
                 )
             except Exception as exc:
                 self._log(f"CV training failed for {algo}: {exc}", level="error")
@@ -509,12 +550,13 @@ Respond with JSON only.
         self._log(f"Ensemble OOF MSE={ensemble_mse:.4f}")
 
         # --- Submission ---
-        submission = pd.DataFrame({"_id": test_ids, "target": test_ensemble})
+        # Columns: index, prediction — sorted by index — no duplicate IDs
+        submission = self._build_submission(test_ids, test_ensemble)
         output_dir = Path(self.cfg.get("output_dir", "output"))
         output_dir.mkdir(parents=True, exist_ok=True)
         sub_path = output_dir / "submission.csv"
         submission.to_csv(sub_path, index=False)
-        self._log(f"Submission saved to {sub_path}")
+        self._log(f"Submission saved to {sub_path} ({len(submission)} rows)")
 
         # --- Store in state ---
         state["models"] = {a: r["models"] for a, r in oof_results.items()}
