@@ -13,7 +13,14 @@ from scipy import stats
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 from agents.base import BaseAgent
+from agents.feature_agent import _compute_target_encoding_map
 from utils.helpers import safe_json_parse
+
+
+def _xgb_predict(booster: Any, X: np.ndarray) -> np.ndarray:
+    """Predict with an xgb.Booster, wrapping X in a DMatrix."""
+    import xgboost as xgb
+    return booster.predict(xgb.DMatrix(X))
 
 
 class EvaluatorAgent(BaseAgent):
@@ -42,7 +49,10 @@ class EvaluatorAgent(BaseAgent):
         "improvement recommendations for a rental-property price regression task (MSE metric)."
     )
 
-    TOP_K_FEATURES = 20  # number of top features to include in report
+    TOP_K_FEATURES = 20
+
+    # TE placeholder columns (object dtype) that must be encoded before predict
+    _TE_COLS = ("host_name", "location_cluster", "type_house")
 
     # ------------------------------------------------------------------
     # Metric computation helpers
@@ -68,7 +78,7 @@ class EvaluatorAgent(BaseAgent):
         return {
             "mean_mse": round(mean, 6),
             "std_mse":  round(std, 6),
-            "cv_pct":   round(100 * std / max(mean, 1e-9), 2),  # coefficient of variation
+            "cv_pct":   round(100 * std / max(mean, 1e-9), 2),
         }
 
     @staticmethod
@@ -77,7 +87,6 @@ class EvaluatorAgent(BaseAgent):
         residuals = y_true - y_pred
         skewness = float(stats.skew(residuals))
         kurtosis = float(stats.kurtosis(residuals))
-        # Shapiro-Wilk on a subsample (expensive on large arrays)
         sample = residuals if len(residuals) <= 5000 else np.random.default_rng(42).choice(residuals, 5000)
         try:
             _, shapiro_p = stats.shapiro(sample)
@@ -99,6 +108,51 @@ class EvaluatorAgent(BaseAgent):
             "is_normal": is_normal,
         }
 
+    # ------------------------------------------------------------------
+    # X_train reconstruction with TE features
+    # ------------------------------------------------------------------
+
+    def _reconstruct_X_train(
+        self,
+        train_feat: pd.DataFrame,
+        y_raw: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Rebuild the training feature matrix exactly as ModelAgent did:
+        numeric columns + target-encoded columns appended at the end.
+
+        This is required for the overfitting check — models were trained on
+        54 features (51 numeric + 3 TE), but train_feat contains the TE cols
+        as object-dtype placeholders that cannot be cast to float32 directly.
+
+        We apply TE using the full training set (no fold split needed here
+        since we only use this for a train-score sanity check, not for
+        generating OOF predictions).
+        """
+        te_cols_present = [c for c in self._TE_COLS if c in train_feat.columns]
+        num_cols = [c for c in train_feat.columns if c not in self._TE_COLS]
+        base = train_feat[num_cols].values.astype(np.float32)
+
+        if not te_cols_present:
+            return base
+
+        global_mean = float(y_raw.mean())
+        extras = []
+        for col in te_cols_present:
+            mapping = _compute_target_encoding_map(
+                col=train_feat[col],
+                target=pd.Series(y_raw, index=train_feat.index),
+                global_mean=global_mean,
+                smoothing=10.0,
+            )
+            extras.append(train_feat[col].map(mapping).fillna(global_mean).values)
+
+        return np.hstack([base, np.column_stack(extras).astype(np.float32)])
+
+    # ------------------------------------------------------------------
+    # Overfitting check
+    # ------------------------------------------------------------------
+
     def _overfitting_check(
         self,
         algo: str,
@@ -110,19 +164,31 @@ class EvaluatorAgent(BaseAgent):
         """
         Estimate train MSE by averaging predictions from all fold models on
         the full training set and comparing to OOF MSE.
+
+        Uses _xgb_predict for XGBoost Boosters (requires DMatrix, not ndarray).
+        X_train must have the same feature count as the models were trained on
+        (i.e. include TE-encoded columns).
         """
         try:
             preds = np.zeros(len(y_train))
             n_models = len(algo_models)
             for model in algo_models:
-                preds += model.predict(X_train) / n_models
+                try:
+                    import xgboost as xgb
+                    if isinstance(model, xgb.Booster):
+                        preds += _xgb_predict(model, X_train) / n_models
+                        continue
+                except ImportError:
+                    pass
+                preds += np.asarray(model.predict(X_train)) / n_models
+
             train_mse = float(mean_squared_error(y_train, preds))
             overfit_ratio = oof_mse / max(train_mse, 1e-9)
             return {
                 "train_mse": round(train_mse, 6),
                 "oof_mse":   round(oof_mse, 6),
                 "ratio":     round(overfit_ratio, 4),
-                "overfitting": overfit_ratio > 1.5,  # OOF > 1.5× train → likely overfit
+                "overfitting": overfit_ratio > 1.5,
             }
         except Exception as exc:
             self._log(f"Overfitting check failed for {algo}: {exc}", level="warning")
@@ -142,24 +208,24 @@ class EvaluatorAgent(BaseAgent):
     def _build_report(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """
         Construct the full evaluation report dict from state.
-        All computations are deterministic.
         """
         y = state["target_series"].values.astype(np.float64)
-        oof_preds = state["oof_predictions"]          # {algo: np.ndarray}
-        cv_scores = state["cv_scores"]                # {algo: {fold_mses, mean, std}}
+        oof_preds = state["oof_predictions"]
+        cv_scores = state["cv_scores"]
         ensemble_oof = state["ensemble_oof"].astype(np.float64)
         feat_importances = state.get("feature_importances", {})
         models_dict = state.get("models", {})
-        # Filter to numeric columns only — train_feat may contain object-dtype
-        # TE placeholder columns that cannot be cast to float32.
-        numeric_cols = [c for c in state["train_feat"].columns
-                        if state["train_feat"][c].dtype != 'object']
-        X_train = state["train_feat"][numeric_cols].values.astype(np.float32)
         feature_names = state.get("feature_names", [])
+
+        # Reconstruct X_train with TE columns appended — matches the feature
+        # count the models were actually trained on (fixes 51 vs 54 mismatch).
+        X_train = self._reconstruct_X_train(
+            train_feat=state["train_feat"],
+            y_raw=y.astype(np.float32),
+        )
 
         report: Dict[str, Any] = {"per_algorithm": {}, "ensemble": {}, "feature_analysis": {}}
 
-        # Per-algorithm metrics
         for algo, oof in oof_preds.items():
             oof_arr = oof.astype(np.float64)
             metrics = self._compute_metrics(y, oof_arr)
@@ -167,13 +233,7 @@ class EvaluatorAgent(BaseAgent):
             residuals = self._residual_analysis(y, oof_arr)
 
             algo_models = models_dict.get(algo, [])
-            # Overfitting check may fail if the model was trained with TE-augmented
-            # features (more columns) than the raw X_train has. Degrade gracefully.
-            try:
-                overfit = self._overfitting_check(algo, algo_models, X_train, y, metrics["mse"])
-            except Exception as exc:
-                self._log(f"Overfitting check failed for {algo}: {exc}", level="warning")
-                overfit = {"error": str(exc)}
+            overfit = self._overfitting_check(algo, algo_models, X_train, y, metrics["mse"])
 
             top_feats = (
                 self._top_features(feat_importances.get(algo, {}), self.TOP_K_FEATURES)
@@ -189,7 +249,6 @@ class EvaluatorAgent(BaseAgent):
                 "top_features": top_feats,
             }
 
-        # Ensemble metrics
         ens_metrics = self._compute_metrics(y, ensemble_oof)
         ens_residuals = self._residual_analysis(y, ensemble_oof)
         report["ensemble"] = {
@@ -198,7 +257,6 @@ class EvaluatorAgent(BaseAgent):
             "weights": state.get("ensemble_weights", {}),
         }
 
-        # Cross-algorithm feature importance (union of top features)
         if feat_importances:
             combined: Dict[str, float] = {}
             for algo, imp in feat_importances.items():
@@ -215,11 +273,7 @@ class EvaluatorAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _request_interpretation(self, report: Dict[str, Any]) -> str:
-        """
-        Ask the LLM to interpret the evaluation report and suggest improvements.
-        Returns a free-text string.
-        """
-        # Build a compact summary to avoid exceeding context limits
+        """Ask the LLM to interpret the evaluation report and suggest improvements."""
         algo_summaries = {}
         for algo, data in report.get("per_algorithm", {}).items():
             m = data.get("oof_metrics", {})
@@ -245,7 +299,7 @@ class EvaluatorAgent(BaseAgent):
 {json.dumps(algo_summaries, indent=2)}
 
 ### Ensemble OOF metrics
-MSE={ens.get('mse')}, RMSE={ens.get('rmse')}, R²={ens.get('r2')}
+MSE={ens.get('mse')}, RMSE={ens.get('rmse')}, R\u00b2={ens.get('r2')}
 
 ### Top-10 features (weighted importance)
 {json.dumps(top_feats, indent=2)}
@@ -267,19 +321,16 @@ Be specific and actionable. Respond in plain text (no JSON).
     # ------------------------------------------------------------------
 
     def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Build evaluation report deterministically, then get LLM interpretation.
-        """
-        self._log("Building evaluation report…")
+        """Build evaluation report deterministically, then get LLM interpretation."""
+        self._log("Building evaluation report\u2026")
         report = self._build_report(state)
 
-        self._log("Requesting LLM interpretation…")
+        self._log("Requesting LLM interpretation\u2026")
         interpretation = self._request_interpretation(report)
 
         state["evaluation_report"] = report
         state["llm_interpretation"] = interpretation
 
-        # Log a quick summary
         best_algo = min(
             report["per_algorithm"],
             key=lambda a: report["per_algorithm"][a]["oof_metrics"]["mse"],

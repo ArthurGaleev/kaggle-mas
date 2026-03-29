@@ -24,6 +24,12 @@ OPTUNA TUNING SPLIT
 Hyperparameter search uses a KFold with a *different* random_state than the CV
 loop (seed+7919) so the tuning validation fold never coincides with any of the
 CV validation folds, eliminating optimistic bias in the found parameters.
+
+TARGET TRANSFORM
+----------------
+Log-transform on the target is intentionally disabled (use_log_target=False).
+GBDT models handle moderately skewed rental prices natively, and log1p/expm1
+roundtripping was observed to hurt leaderboard MSE in practice.
 """
 
 import gc
@@ -48,18 +54,12 @@ from utils.helpers import safe_json_parse
 _logger = logging.getLogger("kaggle-mas.model_agent")
 
 # Prime offset added to the CV random_state to produce a disjoint tuning fold.
-# Using a large prime ensures the two KFold permutations do not accidentally
-# share the same fold-0 split for small dataset sizes.
 _TUNE_SEED_OFFSET: int = 7919
 
 
 def _xgb_predict(booster: Any, X: np.ndarray) -> np.ndarray:
     """
     Predict with an ``xgb.Booster``, wrapping *X* in a ``DMatrix``.
-
-    ``xgb.Booster.predict`` only accepts a ``DMatrix``; passing a raw
-    ``np.ndarray`` raises ``TypeError: Expecting data to be a DMatrix object``.
-    This helper centralises the wrap so callers stay clean.
     """
     import xgboost as xgb
     return booster.predict(xgb.DMatrix(X))
@@ -85,11 +85,12 @@ class ModelAgent(BaseAgent):
         cv_scores       (dict):          per-fold metrics by model name.
         feature_importances (dict):      mean feature importance per algorithm.
         ensemble_weights (dict):         weights used for ensemble.
-        ensemble_oof    (np.ndarray):    ensemble OOF predictions.
+        ensemble_oof    (np.ndarray):    ensemble OOF predictions (raw price scale).
         test_predictions (dict):         test predictions per algorithm.
-        ensemble_test   (np.ndarray):    weighted ensemble test predictions.
+        ensemble_test   (np.ndarray):    weighted ensemble test predictions (raw price scale).
         submission_df   (pd.DataFrame):  submission-ready DataFrame.
         model_plan      (dict):          LLM-generated model plan.
+        use_log_target  (bool):          whether log-transform was applied (always False).
     """
 
     SYSTEM_PROMPT = (
@@ -205,7 +206,7 @@ Respond with JSON only.
                         "device": "gpu",
                         "n_estimators": 1000,
                         "early_stopping_rounds": 50,
-                        "bagging_freq": 1,  # Required for bagging_fraction to take effect
+                        "bagging_freq": 1,
                     },
                     "search_space": {
                         "num_leaves":        {"type": "int",   "low": 31,   "high": 255},
@@ -278,7 +279,7 @@ Respond with JSON only.
         return params
 
     # ------------------------------------------------------------------
-    # Model training helpers — delegate to ModelTools for GPU + training
+    # Model training helpers
     # ------------------------------------------------------------------
 
     def _train_lightgbm(
@@ -319,10 +320,6 @@ Respond with JSON only.
         fixed: Dict[str, Any],
     ) -> Tuple[Any, float]:
         merged = {**fixed, **params}
-        # CatBoost handles NaN natively (since v0.22) with optimal split
-        # direction learning.  Using a -999 sentinel instead forces the model
-        # to treat NaN as an actual numeric value, creating spurious splits
-        # and degrading prediction quality.
         model = ModelTools.train_catboost(X_train, y_train, X_val, y_val, merged)
         val_pred = np.asarray(model.predict(X_val))
         return model, float(mean_squared_error(y_val, val_pred))
@@ -344,23 +341,6 @@ Respond with JSON only.
         """
         Apply smoothed target-mean encoding using only the training fold's
         labels, then return updated numpy arrays and extended feature names.
-
-        Parameters
-        ----------
-        train_df, val_df, test_df:
-            DataFrames that still contain the raw TE placeholder columns.
-        target_fold:
-            Target values for the *training fold only* (no leakage).
-        global_mean:
-            Global mean of the full target, used as a Bayesian prior.
-        smoothing:
-            Smoothing weight for the Bayesian prior.
-        feature_names:
-            Existing numeric feature names (TE cols not yet included).
-
-        Returns
-        -------
-        Updated X_tr, X_vl, X_te arrays and extended feature_names list.
         """
         te_cols_present = [c for c in self._TE_COLS if c in train_df.columns]
         if not te_cols_present:
@@ -387,7 +367,6 @@ Respond with JSON only.
             extra_test.append(test_df[col].map(mapping).fillna(global_mean).values)
             new_names.append(feat)
 
-        # Build numeric matrices: numeric features + TE features
         num_cols = [c for c in train_df.columns if c not in self._TE_COLS]
 
         def _stack(df: pd.DataFrame, extras: List[np.ndarray]) -> np.ndarray:
@@ -421,15 +400,8 @@ Respond with JSON only.
     ) -> Dict[str, Any]:
         """
         Run Optuna to find best hyperparameters for one algorithm.
-
-        Uses a KFold with ``random_state=seed + _TUNE_SEED_OFFSET`` so the
-        tuning validation split is *disjoint* from all CV folds (which use
-        ``random_state=seed``).  This eliminates the optimistic bias that
-        occurs when the tuning fold coincides with a later CV validation fold.
-
-        Target encoding is applied inside the tuning fold to match the CV
-        feature space, preventing feature-count mismatches between tuning
-        and final CV training.
+        Uses a disjoint KFold (seed + _TUNE_SEED_OFFSET) to avoid
+        optimistic bias vs the CV folds.
         """
         search_space = algo_cfg.get("search_space", {})
         fixed = algo_cfg.get("fixed_params", {})
@@ -441,11 +413,8 @@ Respond with JSON only.
             "catboost": self._train_catboost,
         }[algo]
 
-        # Use a different random_state than the CV loop to get a disjoint
-        # validation fold, preventing optimistic bias in tuned params.
         tune_kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed + _TUNE_SEED_OFFSET)
-
-        _MAX_TUNE_FOLDS = 3  # Use at most 3 folds per trial for speed
+        _MAX_TUNE_FOLDS = 3
 
         def objective(trial: optuna.Trial) -> float:
             params = self._sample_params(trial, search_space)
@@ -459,11 +428,10 @@ Respond with JSON only.
                     y_t = y[tune_train_idx]
                     y_v = y[tune_val_idx]
 
-                    # Apply fold-level target encoding to match CV feature space
                     X_t, X_v, _, _ = self._apply_fold_target_encoding(
                         train_df=train_fold_df,
                         val_df=val_fold_df,
-                        test_df=val_fold_df,  # dummy, not used
+                        test_df=val_fold_df,
                         target_fold=y_t,
                         global_mean=global_mean,
                         smoothing=te_smoothing,
@@ -489,15 +457,7 @@ Respond with JSON only.
 
     @staticmethod
     def _predict(model: Any, X: np.ndarray) -> np.ndarray:
-        """
-        Dispatch prediction to the correct API for each model type.
-
-        - ``xgb.Booster`` requires a ``DMatrix``; passing a raw array raises
-          ``TypeError: Expecting data to be a DMatrix object``.  We detect the
-          Booster type and wrap via :func:`_xgb_predict`.
-        - ``lgb.Booster`` (and sklearn-style models) expose a plain
-          ``predict(array)`` API.
-        """
+        """Dispatch prediction to the correct API for each model type."""
         try:
             import xgboost as xgb
             if isinstance(model, xgb.Booster):
@@ -522,11 +482,7 @@ Respond with JSON only.
     ) -> Dict[str, Any]:
         """
         Train the algorithm with best_params across n_splits folds.
-
-        Target encoding (if enabled) is applied *inside* each fold using only
-        the fold's training rows to prevent leakage into the validation fold.
-
-        Returns OOF preds, fold MSEs, test preds, and feature importances.
+        All MSE values are in raw price space (no log transform).
         """
         fixed = dict(algo_cfg.get("fixed_params", {}))
         train_fn = {
@@ -549,7 +505,6 @@ Respond with JSON only.
             y_tr = y[train_idx]
             y_vl = y[val_idx]
 
-            # Apply per-fold target encoding (no leakage)
             X_tr, X_vl, X_te, fold_feat_names = self._apply_fold_target_encoding(
                 train_df=train_fold_df,
                 val_df=val_fold_df,
@@ -566,17 +521,14 @@ Respond with JSON only.
             fold_mses.append(fold_mse)
             models.append(model)
 
-            # Feature importances
             if hasattr(model, "feature_importances_"):
                 importances.append(model.feature_importances_)
             elif hasattr(model, "feature_importance"):
                 importances.append(model.feature_importance())
             elif hasattr(model, "get_score"):
-                # XGBoost Booster: get_score() returns {f0: val, ...}
                 score = model.get_score(importance_type="gain")
                 imp_arr = np.zeros(len(fold_feat_names))
                 for fname, val in score.items():
-                    # Feature names are f0, f1, ... by default
                     try:
                         idx = int(fname.replace("f", ""))
                         if idx < len(imp_arr):
@@ -616,13 +568,11 @@ Respond with JSON only.
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
         """
         Combine per-algorithm OOF and test predictions into a weighted ensemble.
-
-        First attempts stacking via RidgeCV meta-learner. Falls back to
-        inverse-MSE weighted average if stacking fails.
+        Attempts RidgeCV stacking first; falls back to inverse-MSE weighted average.
+        All inputs and outputs are in raw price space.
         """
         algos = list(oof_results.keys())
 
-        # --- Try stacking meta-learner first ---
         if len(algos) >= 2:
             try:
                 from sklearn.linear_model import RidgeCV
@@ -636,23 +586,14 @@ Respond with JSON only.
                 )
 
                 meta = RidgeCV(alphas=[0.001, 0.01, 0.1, 1.0, 10.0, 100.0])
-
-                # Use cross_val_predict for OOF ensemble to avoid leakage.
-                # Fitting RidgeCV on oof_matrix and predicting on the SAME
-                # oof_matrix produces an optimistically biased OOF MSE
-                # (the meta-learner has seen all the data it predicts on).
-                # cross_val_predict ensures each OOF prediction is made by
-                # a meta-learner that never saw that row during fitting.
                 stacking_cv = KFold(n_splits=5, shuffle=True, random_state=42)
                 oof_ensemble = cross_val_predict(
                     meta, oof_matrix, y, cv=stacking_cv
                 )
 
-                # Fit final meta-learner on ALL OOF data for test predictions
                 meta.fit(oof_matrix, y)
                 test_ensemble = meta.predict(test_matrix)
 
-                # Report meta-learner coefficients as weights
                 weight_dict = dict(zip(algos, meta.coef_.tolist()))
                 self._log(f"Stacking meta-learner (RidgeCV) weights: {weight_dict}, "
                           f"alpha={meta.alpha_}")
@@ -661,12 +602,11 @@ Respond with JSON only.
                 self._log(f"Stacking failed, falling back to weighted average: {exc}",
                           level="warning")
 
-        # --- Fallback: inverse-MSE weighted average ---
         mses = np.array([oof_results[a]["mean_cv_mse"] for a in algos])
 
         if method == "inverse_mse":
             raw_weights = 1.0 / np.maximum(mses, 1e-9)
-        else:  # equal weights
+        else:
             raw_weights = np.ones(len(algos))
 
         weights = raw_weights / raw_weights.sum()
@@ -692,25 +632,6 @@ Respond with JSON only.
         test_ensemble: np.ndarray,
         test_ids: pd.Series,
     ) -> pd.DataFrame:
-        """
-        Build a submission DataFrame with the actual test ``_id`` values.
-
-        Using the real IDs (rather than a bare integer range) ensures the
-        submission rows are correctly matched to test examples even when the
-        test set is not pre-sorted by row order.
-
-        Parameters
-        ----------
-        test_ensemble:
-            Array of ensemble predictions for the test set.
-        test_ids:
-            ``_id`` column values from the original test DataFrame.
-
-        Returns
-        -------
-        pd.DataFrame
-            Columns: ``_id`` (original test IDs), ``prediction`` (float).
-        """
         return pd.DataFrame(
             {
                 "_id": test_ids.values,
@@ -725,51 +646,39 @@ Respond with JSON only.
     def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """
         1. Ask LLM for model plan.
-        2. Tune each enabled algorithm with Optuna (disjoint fold, seed+_TUNE_SEED_OFFSET).
-        3. Train with K-fold CV using best params; apply target encoding
-           inside each fold to prevent leakage.
+        2. Tune each enabled algorithm with Optuna.
+        3. Train with K-fold CV; apply target encoding inside each fold.
         4. Build ensemble.
-        5. Populate state with submission_df (saving to disk is main.py's responsibility).
+        5. Populate state with submission_df.
+
+        All predictions and MSE values are in raw price space.
+        Log-transform is intentionally disabled (use_log_target=False).
         """
-        X_df: pd.DataFrame = state["train_feat"]   # may contain TE placeholder cols
+        X_df: pd.DataFrame = state["train_feat"]
         test_df: pd.DataFrame = state["test_feat"]
-        y_raw: np.ndarray = state["target_series"].values.astype(np.float32)
+        y: np.ndarray = state["target_series"].values.astype(np.float32)
         test_ids: pd.Series = state["test_ids"]
         feature_names: List[str] = state["feature_names"]
 
-        # Log-transform target for right-skewed rental prices.
-        # Training on log1p(target) and inverse-transforming predictions with
-        # expm1() compresses expensive outliers that inflate MSE.
-        use_log_target: bool = True
-        if use_log_target:
-            y = np.log1p(y_raw)
-            self._log("Using log1p(target) for training (will inverse-transform predictions).")
-        else:
-            y = y_raw
+        # Log-transform disabled: GBDT models handle rental price scale natively.
+        # Empirically log1p/expm1 roundtripping increased leaderboard MSE.
+        use_log_target: bool = False
+        self._log("Training on raw target values (use_log_target=False).")
 
-        # Read target-encoding config from feature plan
         feature_plan = state.get("feature_plan", {})
         te_cfg = feature_plan.get("groups", {}).get("target_encoding", {})
         te_enabled: bool = te_cfg.get("enabled", True)
         te_smoothing: float = float(te_cfg.get("smoothing", 10.0))
         global_mean: float = float(y.mean())
 
-        # If TE not enabled, drop TE placeholder columns before building arrays
         if not te_enabled:
             drop_te = [c for c in self._TE_COLS if c in X_df.columns]
             if drop_te:
                 X_df = X_df.drop(columns=drop_te)
                 test_df = test_df.drop(columns=drop_te, errors="ignore")
 
-        # Build pure-numeric arrays for Optuna tuning (no TE — uses first fold only)
-        # TE will be applied fold-by-fold inside _cross_validate_algorithm.
-        num_cols = [c for c in X_df.columns if c not in self._TE_COLS]
-        X_numeric: np.ndarray = X_df[num_cols].values.astype(np.float32)
-
-        # Log GPU status once at the start (uses cached check from ModelTools)
         _logger.info("[GPU] GPU available: %s", gpu_available())
 
-        # --- LLM plan ---
         plan = self._request_model_plan(state)
         state["model_plan"] = plan
         models_cfg: Dict[str, Any] = plan.get("models", {})
@@ -788,8 +697,6 @@ Respond with JSON only.
             self._log(f"Tuning {algo} with Optuna ({algo_cfg.get('n_trials', 20)} trials)\u2026")
 
             try:
-                # Pass X_df (with TE placeholder cols) so Optuna tunes on the
-                # same feature space as CV training (fold-level TE applied inside).
                 best_params = self._tune_algorithm(
                     algo, algo_cfg, X_df, y, seed, n_splits,
                     feature_names=feature_names,
@@ -818,7 +725,7 @@ Respond with JSON only.
                 oof_results[algo] = result
                 test_predictions[algo] = result["test_predictions"]
                 self._log(
-                    f"[{algo}] CV MSE={result['mean_cv_mse']:.4f} \u00b1 {result['std_cv_mse']:.4f}"
+                    f"[{algo}] CV MSE={result['mean_cv_mse']:.4f} \u00b1 {result['std_cv_mse']:.4f} (raw price scale)"
                 )
             except Exception as exc:
                 self._log(f"CV training failed for {algo}: {exc}", level="error")
@@ -829,38 +736,23 @@ Respond with JSON only.
         if not oof_results:
             raise RuntimeError("No models trained successfully.")
 
-        # --- Ensemble ---
         oof_ensemble, test_ensemble, ensemble_weights = self._build_ensemble(
             oof_results, test_predictions, y, method=ensemble_method
         )
 
-        # Inverse log-transform predictions back to original price scale
-        if use_log_target:
-            oof_ensemble = np.expm1(oof_ensemble)
-            test_ensemble = np.expm1(test_ensemble)
-            self._log("Inverse log-transform applied to OOF and test predictions.")
-
-        # Clip predictions: rental prices cannot be negative, and extreme
-        # high-end outlier predictions inflate MSE quadratically.
-        # Winsorize to [0, cap] where cap is the 99.5th percentile of the
-        # training target scaled up by 1.5× as a safety margin.  This is
-        # guaranteed to reduce MSE when the true target is bounded (which
-        # rental prices are) because predictions far outside the observed
-        # range are almost certainly errors, and clipping them closer to
-        # the distribution reduces squared error.
-        upper_cap = float(np.percentile(y_raw, 99.5)) * 1.5
+        # Clip predictions: rental prices cannot be negative.
+        # Cap at 99.5th percentile × 1.5 to reduce quadratic MSE penalty from
+        # extreme outlier predictions without discarding high-end listings.
+        upper_cap = float(np.percentile(y, 99.5)) * 1.5
         test_ensemble = np.clip(test_ensemble, 0, upper_cap)
         oof_ensemble = np.clip(oof_ensemble, 0, upper_cap)
-        self._log(f"Predictions clipped to [0, {upper_cap:.1f}] "
-                  f"(99.5th percentile of target × 1.5)")
+        self._log(f"Predictions clipped to [0, {upper_cap:.1f}] (99.5th pct of target × 1.5)")
 
-        ensemble_mse = float(mean_squared_error(y_raw, oof_ensemble))
-        self._log(f"Ensemble OOF MSE={ensemble_mse:.4f}")
+        ensemble_mse = float(mean_squared_error(y, oof_ensemble))
+        self._log(f"Ensemble OOF MSE={ensemble_mse:.4f} (raw price scale)")
 
-        # --- Submission --- (saving to disk is owned by main.py)
         submission = self._build_submission(test_ensemble, test_ids)
 
-        # --- Store in state ---
         state["models"] = {a: r["models"] for a, r in oof_results.items()}
         state["oof_predictions"] = {a: r["oof_predictions"] for a, r in oof_results.items()}
         state["cv_scores"] = {

@@ -13,7 +13,11 @@ project:
 
 pipeline:
   max_feedback_loops: 3
-  target_mse_threshold: 1500.0
+  # Target OOF MSE threshold (raw price scale) to trigger ACCEPT in the
+  # feedback loop. Current best leaderboard score is ~9274.76, so the
+  # OOF threshold is set conservatively below that. 1500.0 was unreachable
+  # and caused the orchestrator to always exhaust max_feedback_loops.
+  target_mse_threshold: 8000.0
   cv_folds: 5
   test_size: 0.2
   enable_rag: true
