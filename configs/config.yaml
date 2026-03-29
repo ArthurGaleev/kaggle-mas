@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - llm: groq
+  - llm: openrouter
   - pipeline: default
 
 project:
@@ -24,43 +24,43 @@ models:
   lightgbm:
     enabled: true
     params:
-      n_estimators: 1000
-      learning_rate: 0.05
-      max_depth: 7
-      num_leaves: 63
+      n_estimators: 2000
+      learning_rate: 0.03
+      max_depth: 8
+      num_leaves: 127
       subsample: 0.8
-      colsample_bytree: 0.8
-      reg_alpha: 0.1
+      colsample_bytree: 0.7
+      reg_alpha: 0.05
       reg_lambda: 0.1
       min_child_samples: 20
-      early_stopping_rounds: 50
+      early_stopping_rounds: 100
       device: gpu           # GPU acceleration; ModelAgent falls back to cpu if no GPU
   xgboost:
     enabled: true
     params:
-      n_estimators: 1000
-      learning_rate: 0.05
-      max_depth: 7
+      n_estimators: 2000
+      learning_rate: 0.03
+      max_depth: 8
       subsample: 0.8
-      colsample_bytree: 0.8
-      reg_alpha: 0.1
+      colsample_bytree: 0.7
+      reg_alpha: 0.05
       reg_lambda: 0.1
-      early_stopping_rounds: 50
+      early_stopping_rounds: 100
       device: cuda          # XGBoost >=2.0 GPU; ModelAgent selects gpu_hist for older versions
   catboost:
     enabled: true
     params:
-      iterations: 1000
-      learning_rate: 0.05
-      depth: 7
+      iterations: 2000
+      learning_rate: 0.03
+      depth: 8
       l2_leaf_reg: 3
-      early_stopping_rounds: 50
-      verbose: 100
+      early_stopping_rounds: 100
+      verbose: 200
       task_type: GPU        # GPU acceleration; ModelAgent falls back to CPU if no GPU
 
 guardrails:
   max_input_rows: 500000
-  max_features: 200
+  max_features: 300
   max_target_value: 100000
   min_target_value: 0
   max_missing_ratio: 0.95
