@@ -25,11 +25,23 @@ Hyperparameter search uses a KFold with a *different* random_state than the CV
 loop (seed+7919) so the tuning validation fold never coincides with any of the
 CV validation folds, eliminating optimistic bias in the found parameters.
 
+Algo-specific TPE sampler seeds: lgbm=seed, xgb=seed+1, catboost=seed+2.
+This ensures each algorithm's Optuna search explores a different initial
+hyperparameter region and avoids degenerate convergence to the same params
+(observed previously when all used the same seed=42).
+
 TARGET TRANSFORM
 ----------------
 Log-transform on the target is intentionally disabled (use_log_target=False).
 GBDT models handle moderately skewed rental prices natively, and log1p/expm1
 roundtripping was observed to hurt leaderboard MSE in practice.
+
+PREDICTION CLIPPING
+-------------------
+Predictions are clipped to [0, cap] where cap = 99.9th percentile of training
+target x 3.0. The old cap (99.5th pct x 1.5 ≈ 547) was cutting off legitimate
+high-value listings. The new cap allows for the full realistic price range
+while still blocking absurd outlier predictions.
 """
 
 import gc
@@ -55,6 +67,17 @@ _logger = logging.getLogger("kaggle-mas.model_agent")
 
 # Prime offset added to the CV random_state to produce a disjoint tuning fold.
 _TUNE_SEED_OFFSET: int = 7919
+
+# Per-algorithm seed offsets for Optuna TPE sampler.
+# Ensures each algorithm explores a different initial hyperparameter region.
+_ALGO_SEED_OFFSETS: Dict[str, int] = {
+    "lightgbm": 0,
+    "xgboost": 1,
+    "catboost": 2,
+}
+
+# Max number of CV folds used inside each Optuna trial (keep low to limit tuning time).
+_MAX_TUNE_FOLDS: int = 2
 
 
 def _xgb_predict(booster: Any, X: np.ndarray) -> np.ndarray:
@@ -129,8 +152,8 @@ price regression task (Kaggle, MSE metric).
 - catboost:  strong with categoricals; GPU via task_type='GPU'
 
 ## Instructions
-Decide which models to enable, how many Optuna trials to run (≤ 30 for notebook
-constraints), and what param ranges to search.  Keep it practical.
+Decide which models to enable, how many Optuna trials to run, and what param
+ranges to search. Keep it practical for notebook constraints.
 Always include the GPU acceleration parameter for each enabled model.
 
 Return strict JSON only:
@@ -138,11 +161,11 @@ Return strict JSON only:
   "models": {{
     "lightgbm": {{
       "enabled": true,
-      "n_trials": 20,
+      "n_trials": 12,
       "fixed_params": {{
         "verbosity": -1,
         "device": "gpu",
-        "n_estimators": 1000,
+        "n_estimators": 2000,
         "early_stopping_rounds": 50,
         "bagging_freq": 1
       }},
@@ -158,10 +181,10 @@ Return strict JSON only:
     }},
     "xgboost": {{
       "enabled": true,
-      "n_trials": 15,
+      "n_trials": 10,
       "fixed_params": {{
         "device": "cuda",
-        "n_estimators": 1000,
+        "n_estimators": 2000,
         "early_stopping_rounds": 50,
         "verbosity": 0
       }},
@@ -176,9 +199,9 @@ Return strict JSON only:
     }},
     "catboost": {{
       "enabled": true,
-      "n_trials": 10,
+      "n_trials": 6,
       "fixed_params": {{
-        "iterations": 1000,
+        "iterations": 2000,
         "early_stopping_rounds": 50,
         "task_type": "GPU",
         "verbose": 0
@@ -200,11 +223,11 @@ Respond with JSON only.
             "models": {
                 "lightgbm": {
                     "enabled": True,
-                    "n_trials": 20,
+                    "n_trials": 12,
                     "fixed_params": {
                         "verbosity": -1,
                         "device": "gpu",
-                        "n_estimators": 1000,
+                        "n_estimators": 2000,
                         "early_stopping_rounds": 50,
                         "bagging_freq": 1,
                     },
@@ -220,10 +243,10 @@ Respond with JSON only.
                 },
                 "xgboost": {
                     "enabled": True,
-                    "n_trials": 15,
+                    "n_trials": 10,
                     "fixed_params": {
                         "device": "cuda",
-                        "n_estimators": 1000,
+                        "n_estimators": 2000,
                         "early_stopping_rounds": 50,
                         "verbosity": 0,
                     },
@@ -238,9 +261,9 @@ Respond with JSON only.
                 },
                 "catboost": {
                     "enabled": True,
-                    "n_trials": 10,
+                    "n_trials": 6,
                     "fixed_params": {
-                        "iterations": 1000,
+                        "iterations": 2000,
                         "early_stopping_rounds": 50,
                         "task_type": "GPU",
                         "verbose": 0,
@@ -402,10 +425,13 @@ Respond with JSON only.
         Run Optuna to find best hyperparameters for one algorithm.
         Uses a disjoint KFold (seed + _TUNE_SEED_OFFSET) to avoid
         optimistic bias vs the CV folds.
+
+        Each algorithm uses a unique TPE sampler seed (seed + algo offset)
+        to ensure different algorithms explore different hyperparameter regions.
         """
         search_space = algo_cfg.get("search_space", {})
         fixed = algo_cfg.get("fixed_params", {})
-        n_trials = algo_cfg.get("n_trials", 20)
+        n_trials = algo_cfg.get("n_trials", 12)
 
         train_fn = {
             "lightgbm": self._train_lightgbm,
@@ -414,7 +440,11 @@ Respond with JSON only.
         }[algo]
 
         tune_kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed + _TUNE_SEED_OFFSET)
-        _MAX_TUNE_FOLDS = 3
+
+        # Use algo-specific seed offset so each algorithm's TPE sampler starts
+        # from a different random state, preventing degenerate convergence to
+        # identical hyperparameters across algorithms.
+        algo_seed = seed + _ALGO_SEED_OFFSETS.get(algo, 0)
 
         def objective(trial: optuna.Trial) -> float:
             params = self._sample_params(trial, search_space)
@@ -445,7 +475,10 @@ Respond with JSON only.
                 self._log(f"Trial failed: {exc}", level="warning")
                 return float("inf")
 
-        study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=seed))
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=algo_seed),
+        )
         study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
         best_params = study.best_params
         self._log(f"[{algo}] Optuna best MSE={study.best_value:.4f} params={best_params}")
@@ -585,7 +618,7 @@ Respond with JSON only.
                     [test_results[a] for a in algos]
                 )
 
-                meta = RidgeCV(alphas=[0.001, 0.01, 0.1, 1.0, 10.0, 100.0])
+                meta = RidgeCV(alphas=[0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 500.0, 1000.0])
                 stacking_cv = KFold(n_splits=5, shuffle=True, random_state=42)
                 oof_ensemble = cross_val_predict(
                     meta, oof_matrix, y, cv=stacking_cv
@@ -597,6 +630,17 @@ Respond with JSON only.
                 weight_dict = dict(zip(algos, meta.coef_.tolist()))
                 self._log(f"Stacking meta-learner (RidgeCV) weights: {weight_dict}, "
                           f"alpha={meta.alpha_}")
+
+                # Sanity check: if any weight is strongly negative (< -0.2),
+                # stacking is unstable — fall back to inverse-MSE average.
+                if any(w < -0.2 for w in meta.coef_):
+                    self._log(
+                        "Stacking produced strongly negative weights — falling back to "
+                        "inverse-MSE weighted average.",
+                        level="warning",
+                    )
+                    raise ValueError("Negative stacking weights")
+
                 return oof_ensemble, test_ensemble, weight_dict
             except Exception as exc:
                 self._log(f"Stacking failed, falling back to weighted average: {exc}",
@@ -637,9 +681,6 @@ Respond with JSON only.
             0      | 1234.5
             1      | 2345.6
             ...
-
-        Note: commit e4c94a8 changed this to use the _id column, but the
-        correct format is a bare 0-based integer range as the index column.
         """
         n = len(test_ensemble)
         return pd.DataFrame(
@@ -674,6 +715,11 @@ Respond with JSON only.
         # Empirically log1p/expm1 roundtripping increased leaderboard MSE.
         use_log_target: bool = False
         self._log("Training on raw target values (use_log_target=False).")
+        self._log(f"Target stats: mean={float(y.mean()):.2f}, "
+                  f"std={float(y.std()):.2f}, "
+                  f"min={float(y.min()):.2f}, "
+                  f"max={float(y.max()):.2f}, "
+                  f"99.9th_pct={float(np.percentile(y, 99.9)):.2f}")
 
         feature_plan = state.get("feature_plan", {})
         te_cfg = feature_plan.get("groups", {}).get("target_encoding", {})
@@ -704,7 +750,7 @@ Respond with JSON only.
 
         for algo in enabled_algos:
             algo_cfg = models_cfg[algo]
-            self._log(f"Tuning {algo} with Optuna ({algo_cfg.get('n_trials', 20)} trials)\u2026")
+            self._log(f"Tuning {algo} with Optuna ({algo_cfg.get('n_trials', 12)} trials)\u2026")
 
             try:
                 best_params = self._tune_algorithm(
@@ -751,12 +797,12 @@ Respond with JSON only.
         )
 
         # Clip predictions: rental prices cannot be negative.
-        # Cap at 99.5th percentile × 1.5 to reduce quadratic MSE penalty from
-        # extreme outlier predictions without discarding high-end listings.
-        upper_cap = float(np.percentile(y, 99.5)) * 1.5
+        # Use 99.9th percentile x 3.0 to allow for genuine high-value listings.
+        # The old cap (99.5th pct x 1.5) was ~547 which cut off expensive apartments.
+        upper_cap = float(np.percentile(y, 99.9)) * 3.0
         test_ensemble = np.clip(test_ensemble, 0, upper_cap)
         oof_ensemble = np.clip(oof_ensemble, 0, upper_cap)
-        self._log(f"Predictions clipped to [0, {upper_cap:.1f}] (99.5th pct of target \u00d7 1.5)")
+        self._log(f"Predictions clipped to [0, {upper_cap:.1f}] (99.9th pct of target \u00d7 3.0)")
 
         ensemble_mse = float(mean_squared_error(y, oof_ensemble))
         self._log(f"Ensemble OOF MSE={ensemble_mse:.4f} (raw price scale)")

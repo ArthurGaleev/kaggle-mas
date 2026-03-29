@@ -74,7 +74,11 @@ class OrchestratorAgent(BaseAgent):
         interpretation = state.get("llm_interpretation", "")
         iteration = state.get("iteration", 0)
         max_iter = int(OmegaConf.select(self.cfg, "max_iterations", default=3))
-        target_mse = float(OmegaConf.select(self.cfg, "target_mse_threshold", default=1500.0))
+        # FIX: read from cfg.pipeline.target_mse_threshold, not cfg.target_mse_threshold
+        # The key lives under the [pipeline] section in config.yaml.
+        target_mse = float(
+            OmegaConf.select(self.cfg, "pipeline.target_mse_threshold", default=8000.0)
+        )
         history_summary = self._format_history(state.get("decision_history", []))
 
         ens = report.get("ensemble", {}).get("oof_metrics", {})
