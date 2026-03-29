@@ -88,7 +88,7 @@ class BaseAgent(ABC):
         """
         sys = system_prompt if system_prompt is not None else self.SYSTEM_PROMPT
         self._log(f"Calling LLM — prompt length: {len(prompt)} chars")
-        response: str = self.llm_client.generate(prompt, sys)
+        response: str = self.llm_client.generate(prompt, system_prompt=sys)
         self._log(f"LLM responded — response length: {len(response)} chars")
         return response
 
@@ -114,7 +114,7 @@ class BaseAgent(ABC):
         sys = system_prompt if system_prompt is not None else self.SYSTEM_PROMPT
 
         for attempt in range(1, 3):  # try twice
-            raw = self.llm_client.generate(prompt, sys)
+            raw = self.llm_client.generate(prompt, system_prompt=sys)
             parsed = safe_json_parse(raw)
             if parsed is not None:
                 return parsed

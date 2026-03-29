@@ -208,8 +208,15 @@ class KnowledgeBase:
             try:
                 from sentence_transformers import SentenceTransformer  # type: ignore
 
+                import warnings
                 logger.info("Loading sentence-transformers model: %s", self.model_name)
-                self._model = SentenceTransformer(self.model_name)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=".*position_ids.*",
+                        category=FutureWarning,
+                    )
+                    self._model = SentenceTransformer(self.model_name)
             except ImportError as exc:
                 raise ImportError(
                     "sentence-transformers is required for KnowledgeBase. "
