@@ -160,10 +160,13 @@ class ModelTools:
         elapsed = time.perf_counter() - t0
 
         best_iter = booster.best_iteration
-        best_score = booster.best_score.get("valid_0", {}).get("mse", None)
+        # LightGBM normalises the "mse" metric name to "l2" internally,
+        # so best_score stores the value under "l2", not "mse".
+        valid_scores = booster.best_score.get("valid_0", {})
+        best_score = valid_scores.get("mse") or valid_scores.get("l2")
         logger.info(
             "[ModelTools] LightGBM trained: best_iter=%d, val_mse=%.4f, time=%.1fs",
-            best_iter, best_score or float("nan"), elapsed,
+            best_iter, best_score if best_score is not None else float("nan"), elapsed,
         )
         return booster
 
@@ -204,8 +207,10 @@ class ModelTools:
         n_estimators   = int(params.pop("n_estimators",      1000))
         early_stopping = int(params.pop("early_stopping_rounds", 50))
 
-        params.setdefault("objective",  "reg:squarederror")
-        params.setdefault("eval_metric", "rmse")
+        params.setdefault("objective",   "reg:squarederror")
+        # Use "mse" so early stopping and log label are consistent with the
+        # MSE fold scores used throughout ModelAgent and the ensemble weighting.
+        params.setdefault("eval_metric", "mse")
         params.setdefault("seed",        42)
         params.setdefault("verbosity",   0)
 
@@ -232,11 +237,11 @@ class ModelTools:
         elapsed = time.perf_counter() - t0
 
         best_iter  = booster.best_iteration
-        val_scores = evals_result.get("val", {}).get("rmse", [])
-        best_rmse  = min(val_scores) if val_scores else float("nan")
+        val_scores = evals_result.get("val", {}).get("mse", [])
+        best_mse   = min(val_scores) if val_scores else float("nan")
         logger.info(
-            "[ModelTools] XGBoost trained: best_iter=%d, val_rmse=%.4f, time=%.1fs",
-            best_iter, best_rmse, elapsed,
+            "[ModelTools] XGBoost trained: best_iter=%d, val_mse=%.4f, time=%.1fs",
+            best_iter, best_mse, elapsed,
         )
         return booster
 
@@ -299,9 +304,12 @@ class ModelTools:
         )
         elapsed = time.perf_counter() - t0
 
-        best_score = model.get_best_score().get("validation", {}).get("RMSE", float("nan"))
+        # CatBoost optimises RMSE internally; derive val_mse for consistent logging.
+        best_rmse = model.get_best_score().get("validation", {}).get("RMSE", float("nan"))
+        best_mse  = best_rmse ** 2 if best_rmse == best_rmse else float("nan")  # nan-safe square
         logger.info(
-            "[ModelTools] CatBoost trained: val_rmse=%.4f, time=%.1fs", best_score, elapsed
+            "[ModelTools] CatBoost trained: val_rmse=%.4f, val_mse=%.4f, time=%.1fs",
+            best_rmse, best_mse, elapsed,
         )
         return model
 
