@@ -33,6 +33,18 @@ from utils.helpers import safe_json_parse
 _logger = logging.getLogger("kaggle-mas.model_agent")
 
 
+def _xgb_predict(booster: Any, X: np.ndarray) -> np.ndarray:
+    """
+    Predict with an ``xgb.Booster``, wrapping *X* in a ``DMatrix``.
+
+    ``xgb.Booster.predict`` only accepts a ``DMatrix``; passing a raw
+    ``np.ndarray`` raises ``TypeError: Expecting data to be a DMatrix object``.
+    This helper centralises the wrap so callers stay clean.
+    """
+    import xgboost as xgb
+    return booster.predict(xgb.DMatrix(X))
+
+
 class ModelAgent(BaseAgent):
     """
     Trains LightGBM / XGBoost / CatBoost models with Optuna tuning and
@@ -253,8 +265,7 @@ Respond with JSON only.
     ) -> Tuple[Any, float]:
         merged = {**fixed, **params}
         booster = ModelTools.train_xgboost(X_train, y_train, X_val, y_val, merged)
-        import xgboost as xgb
-        val_pred = booster.predict(xgb.DMatrix(X_val))
+        val_pred = _xgb_predict(booster, X_val)
         return booster, float(mean_squared_error(y_val, val_pred))
 
     def _train_catboost(
@@ -324,6 +335,25 @@ Respond with JSON only.
     # K-fold CV training
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _predict(model: Any, X: np.ndarray) -> np.ndarray:
+        """
+        Dispatch prediction to the correct API for each model type.
+
+        - ``xgb.Booster`` requires a ``DMatrix``; passing a raw array raises
+          ``TypeError: Expecting data to be a DMatrix object``.  We detect the
+          Booster type and wrap via :func:`_xgb_predict`.
+        - ``lgb.Booster`` (and sklearn-style models) expose a plain
+          ``predict(array)`` API.
+        """
+        try:
+            import xgboost as xgb
+            if isinstance(model, xgb.Booster):
+                return _xgb_predict(model, X)
+        except ImportError:
+            pass
+        return np.asarray(model.predict(X))
+
     def _cross_validate_algorithm(
         self,
         algo: str,
@@ -359,16 +389,9 @@ Respond with JSON only.
             X_vl, y_vl = X[val_idx], y[val_idx]
 
             model, fold_mse = train_fn(X_tr, y_tr, X_vl, y_vl, dict(best_params), dict(fixed))
-            oof_preds[val_idx] = (
-                model.predict(X_vl)
-                if hasattr(model, "predict")
-                else model.predict(X_vl, num_iteration=model.best_iteration)
-            )
-            test_preds_folds[:, fold_idx] = (
-                model.predict(X_test)
-                if hasattr(model, "predict")
-                else model.predict(X_test, num_iteration=model.best_iteration)
-            )
+            # Use _predict() so xgb.Booster gets a DMatrix, not a raw ndarray
+            oof_preds[val_idx] = self._predict(model, X_vl)
+            test_preds_folds[:, fold_idx] = self._predict(model, X_test)
             fold_mses.append(fold_mse)
             models.append(model)
 
