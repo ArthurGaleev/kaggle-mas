@@ -773,6 +773,10 @@ Respond with JSON only.
             test_ensemble = np.expm1(test_ensemble)
             self._log("Inverse log-transform applied to OOF and test predictions.")
 
+        # Clip predictions: rental prices cannot be negative
+        test_ensemble = np.maximum(test_ensemble, 0)
+        oof_ensemble = np.maximum(oof_ensemble, 0)
+
         ensemble_mse = float(mean_squared_error(y_raw, oof_ensemble))
         self._log(f"Ensemble OOF MSE={ensemble_mse:.4f}")
 
