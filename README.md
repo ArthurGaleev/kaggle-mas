@@ -59,15 +59,9 @@ graph TD
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/YOUR_USERNAME/kaggle-mas/blob/main/notebooks/run_colab.py)
 
 1. Open the notebook
-2. Set `GROQ_API_KEY` (free at [console.groq.com](https://console.groq.com))
+2. Set `OPENROUTER_API_KEY` (free at [openrouter.ai](https://openrouter.ai/))
 3. Click **Run All**
 
-### Kaggle Kernel
-
-1. Fork the [competition notebook](https://www.kaggle.com/code/YOUR_USERNAME/kaggle-mas)
-2. Add `GROQ_API_KEY` as a Kaggle Secret (Settings → Secrets)
-3. Enable GPU (P100) under Settings → Accelerator
-4. Click **Run All** → output goes to `submission.csv` automatically
 
 ---
 
@@ -97,7 +91,7 @@ pip install -e .
 
 # 5. Configure secrets
 cp .env.example .env
-# Edit .env and set GROQ_API_KEY (or another provider key)
+# Edit .env and set OPENROUTER_API_KEY (or another provider key)
 ```
 
 ### Download competition data
@@ -106,6 +100,12 @@ cp .env.example .env
 # Via Kaggle API (recommended)
 kaggle competitions download -c mws-ai-agents-2026
 unzip -o mws-ai-agents-2026.zip -d data/
+
+# Via Google Drive (public dataset mirror)
+pip install -q gdown
+mkdir -p data
+gdown 1Xkag8BW9Q9phWyz1uQWyRVT311rG4tqp -O data.zip
+unzip -o data.zip -d data/
 
 # Or manually — place train.csv and test.csv in data/
 ```
@@ -171,16 +171,24 @@ python main.py project.output_dir=./my_outputs
 
 ```yaml
 # configs/config.yaml (abbreviated)
+defaults:
+  - _self_
+  - llm: openrouter
+  - pipeline: default
+
 project:
+  name: "kaggle-mas-rental"
   seed: 42
   data_dir: "./data"
   output_dir: "./outputs"
+  log_dir: "./logs"
   competition: "mws-ai-agents-2026"
 
 pipeline:
-  max_feedback_loops: 3        # max orchestrator iterations
-  target_mse_threshold: 1500.0 # MSE below which ACCEPT is forced
+  max_feedback_loops: 3
+  target_mse_threshold: 8000.0
   cv_folds: 5
+  test_size: 0.2
   enable_rag: true
   enable_guardrails: true
   enable_monitoring: true
@@ -188,22 +196,66 @@ pipeline:
 models:
   lightgbm:
     enabled: true
-    params: {n_estimators: 1000, learning_rate: 0.05, max_depth: 7}
+    params:
+      n_estimators: 2000
+      learning_rate: 0.03
+      max_depth: 8
+      num_leaves: 127
+      subsample: 0.8
+      colsample_bytree: 0.7
+      reg_alpha: 0.05
+      reg_lambda: 0.1
+      min_child_samples: 20
+      early_stopping_rounds: 100
+      device: gpu
   xgboost:
     enabled: true
-    params: {n_estimators: 1000, learning_rate: 0.05, max_depth: 7}
+    params:
+      n_estimators: 2000
+      learning_rate: 0.03
+      max_depth: 8
+      subsample: 0.8
+      colsample_bytree: 0.7
+      reg_alpha: 0.05
+      reg_lambda: 0.1
+      early_stopping_rounds: 100
+      device: cuda
   catboost:
     enabled: true
-    params: {iterations: 1000, learning_rate: 0.05, depth: 7}
+    params:
+      iterations: 2000
+      learning_rate: 0.03
+      depth: 8
+      l2_leaf_reg: 3
+      early_stopping_rounds: 100
+      verbose: 200
+      task_type: GPU
 
 guardrails:
   max_input_rows: 500000
-  max_features: 200
+  max_features: 300
   max_target_value: 100000
+  min_target_value: 0
+  max_missing_ratio: 0.95
+  max_cardinality: 1000
+  allowed_dtypes: ["int64", "float64", "object", "datetime64"]
+  max_inference_time_seconds: 300
+  input_validation: true
+  output_validation: true
+
+monitoring:
+  log_level: "INFO"
+  track_token_usage: true
+  track_latency: true
+  track_memory: true
+  save_artifacts: true
 
 rag:
+  chunk_size: 512
+  chunk_overlap: 50
   top_k: 5
   embedding_model: "sentence-transformers/all-MiniLM-L6-v2"
+  knowledge_base_path: "./rag/knowledge_base"
 ```
 
 ---
