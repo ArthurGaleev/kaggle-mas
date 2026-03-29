@@ -79,7 +79,7 @@ Five specialized agents are wired together using [LangGraph](https://github.com/
 │  │ OrchestratorAgent│ ←─────────────────────────────────────────────┐ │
 │  └────────┬─────────┘                                               │ │
 │   ACCEPT  │    IMPROVE                                              │ │
-│           │       └── next_agent = feature_agent|model_agent ───────┘ │
+│           │       └── next_agent = feature|model|data_agent ──────┘ │
 │           ▼                                                            │
 │         END                                                            │
 └────────────────────────────────────────────────────────────────────────┘
@@ -121,25 +121,31 @@ Five specialized agents are wired together using [LangGraph](https://github.com/
 **Responsibilities:**
 - Ask the LLM which **feature groups** to activate and with what parameters.
 - Execute each enabled group deterministically:
-  - **Datetime features**: year, month, day-of-week, quarter, days-since-review from `last_dt`
-  - **Geo features**: KMeans clusters on (lat, lon) + haversine distance to city centroid
+  - **Datetime features**: year, month, day-of-week, quarter, days-since-review from `last_dt` (relative to fixed `REFERENCE_DATE = 2026-01-01` for reproducibility)
+  - **Geo features**: KMeans clusters on (lat, lon) + haversine distance to city centroid + distance to assigned cluster centroid
   - **Text features**: TF-IDF + TruncatedSVD on `name` and `location` columns
-  - **Target encoding**: Smoothed mean encoding for categorical columns (fit on train only)
-  - **Frequency encoding**: Relative frequency of each category value
-  - **Interaction features**: Ratio/product combinations for numeric pairs
-  - **Standard scaling**: StandardScaler fit on train, applied to both splits
+  - **Target encoding**: Flag only — actual smoothed mean encoding is deferred to ModelAgent (applied inside each CV fold to prevent leakage)
+  - **Frequency encoding**: Relative frequency of each category value (computed on full train set; minor pre-CV leak, see module docstring)
+  - **Interaction features**: Pairwise products of selected numeric pairs
+  - **Ratio features**: Pairwise ratios of selected numeric pairs
+  - **Log transforms**: `log1p` of right-skewed numeric columns
+  - **Label encoding**: Ordinal encoding for categoricals (fit on train, unseen test categories get -1)
+- **Scaling deliberately omitted**: GBDT models are invariant to monotonic feature transformations, and fitting a scaler before CV splits leaks validation-fold statistics.
+- On feedback iterations, prunes low-importance features (< 1% of max importance) using ensemble-weighted importances from the previous iteration.
 - Hard guardrail: never exceeds `MAX_FEATURES = 500` columns.
 
 **Key methods:**
 | Method | Description |
 |---|---|
 | `execute(state)` | Orchestrates all feature groups |
-| `_add_datetime_features(train, test)` | Temporal signal extraction |
-| `_add_geo_features(train, test, n_clusters)` | KMeans + haversine |
-| `_add_text_features(train, test, n_components)` | TF-IDF + SVD |
-| `_add_target_encoding(train, test, target, smoothing)` | Smoothed mean encoding |
+| `_add_datetime_features(train, test)` | Temporal signal extraction (fixed reference date) |
+| `_add_geo_features(train, test, n_clusters)` | KMeans + haversine + cluster centroid distance |
+| `_add_text_features(train, test, n_components)` | TF-IDF + TruncatedSVD |
 | `_add_frequency_encoding(train, test)` | Relative frequency encoding |
-| `_apply_scaling(train, test, exclude)` | StandardScaler |
+| `_add_interaction_features(train, test, pairs)` | Pairwise product features |
+| `_add_ratio_features(train, test, pairs)` | Pairwise ratio features |
+| `_add_log_transforms(train, test, columns)` | log1p of skewed columns |
+| `_add_label_encoding(train, test, columns)` | Ordinal label encoding |
 
 **State keys produced:** `train_feat`, `test_feat`, `feature_names`, `target_series`, `test_ids`, `feature_plan`
 
@@ -148,15 +154,17 @@ Five specialized agents are wired together using [LangGraph](https://github.com/
 ### 2.3 ModelAgent (`agents/model_agent.py`)
 
 **Responsibilities:**
-- Ask the LLM for hyperparameter hints (can override config defaults).
-- Run **stratified K-fold cross-validation** (default 5 folds) for each enabled model.
-- Train LightGBM, XGBoost, and CatBoost with early stopping.
-- Run **Optuna hyperparameter search** when `pipeline.n_optuna_trials > 0`.
-- Build a **weighted ensemble** (weights derived from OOF MSE).
+- Ask the LLM for a model plan: which algorithms to enable, Optuna trial counts, and search-space adjustments.
+- Run **Optuna TPE hyperparameter search** for each enabled algorithm using a disjoint KFold (seed + 7919) to avoid optimistic bias. Each algorithm uses a unique TPE sampler seed to explore different parameter regions.
+- Run **K-fold cross-validation** (default 5 folds, regular `KFold` — not stratified, appropriate for regression) for each enabled model.
+- Apply **fold-level target encoding** inside each CV fold (smoothed mean encoding using only training fold labels) to prevent leakage.
+- Train LightGBM, XGBoost, and CatBoost with early stopping. GPU acceleration is handled by `ModelTools` with automatic fallback to CPU.
+- Build a **stacking ensemble**: attempts RidgeCV meta-learner first, falls back to inverse-MSE weighted average if stacking weights are unstable (any weight < -0.2).
+- Clip predictions to `[0, 99.9th percentile × 3.0]` to block negative and absurd outlier predictions.
 - Generate out-of-fold (OOF) and test predictions.
 - Produce feature importance rankings.
 
-**State keys produced:** `models`, `oof_predictions`, `cv_scores`, `feature_importances`, `ensemble_weights`, `ensemble_oof`, `test_predictions`, `ensemble_test`, `submission_df`, `ensemble_cv_mse`
+**State keys produced:** `models`, `oof_predictions`, `cv_scores`, `feature_importances`, `ensemble_weights`, `ensemble_oof`, `test_predictions`, `ensemble_test`, `submission_df`, `ensemble_cv_mse`, `model_plan`, `use_log_target`
 
 ---
 
@@ -164,9 +172,11 @@ Five specialized agents are wired together using [LangGraph](https://github.com/
 
 **Responsibilities:**
 - Compute structured evaluation metrics: OOF MSE, RMSE, MAE, R², and per-fold CV scores for each model and the ensemble.
-- Compare against the configured `target_mse_threshold`.
-- Ask the LLM to produce a **natural-language interpretation** of the results, including identified weaknesses.
-- Validate the submission DataFrame against the sample submission format.
+- **CV stability analysis**: mean, std, and coefficient of variation of per-fold MSEs.
+- **Residual analysis**: skewness, kurtosis, Shapiro-Wilk normality test, percentile statistics.
+- **Overfitting check**: computes train MSE by averaging predictions from all fold models on the full training set; flags overfitting when OOF/train MSE ratio > 1.5.
+- **Feature importance analysis**: weighted top-K features across algorithms.
+- Ask the LLM to produce a **natural-language interpretation** of the results, including identified weaknesses and improvement recommendations.
 
 **State keys produced:** `evaluation_report`, `llm_interpretation`
 
@@ -176,20 +186,22 @@ Five specialized agents are wired together using [LangGraph](https://github.com/
 
 **Responsibilities:**
 - Review `evaluation_report` and `llm_interpretation` from EvaluatorAgent.
+- **Adaptive early stop**: if relative MSE improvement from the previous iteration is < 1%, force ACCEPT regardless of the LLM’s recommendation.
 - Ask the LLM to decide **ACCEPT** (done) or **IMPROVE** (continue).
-- If IMPROVE: specify which agent to route back to (`feature_agent` or `model_agent`) and provide an `improvement_plan` dict with targeted suggestions.
+- If IMPROVE: specify which agent to route back to (`feature_agent`, `model_agent`, or `data_agent`) and provide an `improvement_plan` dict with targeted suggestions.
+- Clear stale downstream results when routing back to an earlier agent (prevents stale data from bleeding into re-evaluation).
 - Enforce `cfg.max_iterations` hard cap to prevent infinite loops.
 - Maintain a `decision_history` list for transparency.
 
 **Routing logic:**
 ```
 pipeline_complete=True → END
-next_agent="feature_agent" → feature_rag node → FeatureAgent
-next_agent="model_agent"   → model_rag node   → ModelAgent
-next_agent="data_agent"    → data_rag node    → DataAgent
+next_agent="feature_agent" → feature_rag node → FeatureAgent → ModelAgent → Evaluator
+next_agent="model_agent"   → model_rag node   → ModelAgent → Evaluator
+next_agent="data_agent"    → data_rag node    → DataAgent → FeatureAgent → ModelAgent → Evaluator
 ```
 
-**State keys produced/updated:** `decision`, `next_agent`, `improvement_plan`, `iteration`, `decision_history`, `pipeline_complete`
+**State keys produced/updated:** `decision`, `reasoning`, `next_agent`, `improvement_plan`, `iteration`, `decision_history`, `pipeline_complete`
 
 ---
 
@@ -200,15 +212,17 @@ All inter-agent communication happens through a single **`PipelineState`** Typed
 ```python
 class PipelineState(TypedDict, total=False):
     # Bookkeeping
-    config: Any                   # OmegaConf DictConfig
+    config: Any                          # OmegaConf DictConfig
     data_dir: str
     output_dir: str
     iteration: int
     pipeline_complete: bool
-    decision: str                 # "ACCEPT" | "IMPROVE"
+    decision: str                        # "ACCEPT" | "IMPROVE"
     next_agent: Optional[str]
+    reasoning: str                       # orchestrator reasoning text
     decision_history: List[Dict]
     improvement_plan: Dict
+    agent_timings: Dict[str, float]      # per-agent elapsed seconds
     errors: List[str]
 
     # Data phase
@@ -216,23 +230,35 @@ class PipelineState(TypedDict, total=False):
     test_df: pd.DataFrame
     data_profile: Dict
     cleaning_plan: Dict
+    data_validation_issues: List[str]    # issues from InputValidator
 
     # Feature phase
     train_feat: pd.DataFrame
     test_feat: pd.DataFrame
     feature_names: List[str]
     target_series: pd.Series
+    test_ids: pd.Series                  # _id column from test
     feature_plan: Dict
+    feature_validation_issues: List[str] # issues from InputValidator (features)
 
     # Model phase
     models: Dict
+    oof_predictions: Dict                # per-algorithm OOF predictions
+    cv_scores: Dict                      # per-fold metrics by model name
+    feature_importances: Dict
+    ensemble_weights: Dict
+    ensemble_oof: np.ndarray
+    test_predictions: Dict
     ensemble_test: np.ndarray
     submission_df: pd.DataFrame
     ensemble_cv_mse: float
+    model_plan: Dict                     # LLM-generated model training plan
+    use_log_target: bool                 # always False (disabled)
 
     # Evaluation phase
     evaluation_report: Dict
     llm_interpretation: str
+    output_validation_issues: List[str]  # issues from OutputValidator
 
     # RAG context (injected before each agent)
     rag_context_data: str
@@ -415,24 +441,31 @@ All providers are accessed via an **OpenAI-compatible API** (`openai` Python SDK
 
 | Provider | Config file | Model (default) | Speed | Cost |
 |---|---|---|---|---|
+| **OpenRouter** | `configs/llm/openrouter.yaml` | `nvidia/nemotron-3-super-120b-a12b:free` | Fast | Free (default) |
 | **Groq** | `configs/llm/groq.yaml` | `llama-3.3-70b-versatile` | Very fast | Free tier |
 | **HuggingFace** | `configs/llm/huggingface.yaml` | `Qwen/Qwen2.5-72B-Instruct` | Moderate | Free tier |
-| **OpenRouter** | `configs/llm/openrouter.yaml` | `anthropic/claude-3.5-sonnet` | Fast | Pay-per-use |
+| **Local** | `configs/llm/local_hf.yaml` | `meta-llama/Llama-3.3-70B-Instruct` | Moderate | Free (on-device) |
 
 ### Switching Providers
 
 Hydra config override on the command line:
 
 ```bash
+python main.py llm=groq
 python main.py llm=huggingface
-python main.py llm=openrouter
+python main.py llm=local_hf
+python main.py llm=local_hf llm.model=Qwen/Qwen3-80B-A3B-Instruct
 ```
 
 Or set in `configs/config.yaml`:
 ```yaml
 defaults:
-  - llm: groq  # change to huggingface or openrouter
+  - llm: openrouter  # change to groq, huggingface, or local_hf
 ```
+
+### Local Provider
+
+The `local` provider loads models directly on Kaggle’s 2×T4 GPUs using `transformers` + `bitsandbytes` 4-bit NF4 quantization and HuggingFace Accelerate’s `device_map="auto"` for automatic multi-GPU layer splitting. Memory budget per GPU is capped at 14 GiB to leave headroom for activations. Flash Attention is disabled by default (T4 is Turing architecture, not Ampere+).
 
 ### LLMClient Features
 
@@ -446,9 +479,9 @@ defaults:
 
 Set via environment variable (`.env` file or shell export):
 ```bash
+export OPENROUTER_API_KEY="sk-or-..." # for OpenRouter (default)
 export GROQ_API_KEY="gsk_..."        # for Groq
-export HF_TOKEN="hf_..."             # for HuggingFace
-export OPENROUTER_API_KEY="sk-or-..." # for OpenRouter
+export HF_TOKEN="hf_..."             # for HuggingFace and Local (gated model downloads)
 ```
 
 ---
@@ -467,39 +500,54 @@ Deep learning methods (MLP, TabNet, NODE) rarely outperform well-tuned GBDT on t
 ### LightGBM
 
 - **Strength**: fastest training among the three; excellent on high-cardinality categoricals via `cat_feature` support; leaf-wise tree growth captures complex interactions
-- **Configuration**: `num_leaves=63`, `min_child_samples=20`, early stopping at 50 rounds
+- **Configuration**: `num_leaves=127`, `min_child_samples=20`, `learning_rate=0.03`, early stopping at 100 rounds (config defaults; LLM plan may adjust)
+- **GPU**: `device='gpu'` + OpenCL ICD auto-setup; multi-GPU via `num_gpu` when >1 GPU detected
 - **Use case**: primary model; also the fastest for Optuna sweeps
 
 ### XGBoost
 
-- **Strength**: level-wise tree growth tends to generalize better on noisier data; strong regularization (`reg_alpha`, `reg_lambda`) prevents overfitting; GPU support via `tree_method="gpu_hist"`
-- **Configuration**: `max_depth=7`, `subsample=0.8`, `colsample_bytree=0.8`
+- **Strength**: level-wise tree growth tends to generalize better on noisier data; strong regularization (`reg_alpha`, `reg_lambda`) prevents overfitting
+- **Configuration**: `max_depth=8`, `subsample=0.8`, `colsample_bytree=0.7`, early stopping at 100 rounds
+- **GPU**: `device='cuda'` (XGBoost ≥2.0) with `tree_method='hist'`; multi-GPU via `n_gpus=-1`
 - **Use case**: diversity in the ensemble (different inductive bias from LightGBM)
 
 ### CatBoost
 
 - **Strength**: native ordered target encoding avoids target leakage; handles raw categorical columns without preprocessing; often best on text-heavy or high-cardinality datasets
-- **Configuration**: `depth=7`, `l2_leaf_reg=3`, `verbose=100`
+- **Configuration**: `depth=8`, `l2_leaf_reg=3`, `verbose=200`, early stopping at 100 rounds
+- **GPU**: `task_type='GPU'`; multi-GPU via `devices='0:N-1'` range notation
 - **Use case**: handles `host_name`, `location_cluster`, `type_house` natively; adds orthogonal diversity to the ensemble
 
 ### Ensemble Strategy
 
-Weights are computed from **inverse OOF MSE** (lower MSE → higher weight):
+The ensemble uses a **two-tier strategy**:
+
+1. **RidgeCV stacking** (primary): When ≥2 algorithms are enabled, a RidgeCV meta-learner is fit on the OOF prediction matrix. Alpha is selected from `[0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 500.0, 1000.0]` via 5-fold CV. If any weight is strongly negative (< -0.2), stacking is considered unstable and the fallback is used.
+
+2. **Inverse-MSE weighted average** (fallback): Weights are computed from inverse OOF MSE:
 ```python
 weights = {algo: 1/mse for algo, mse in oof_mse.items()}
 total = sum(weights.values())
 weights = {algo: w/total for algo, w in weights.items()}
 ```
 
-Ensemble test predictions = weighted average of per-model test predictions.
+Final predictions are clipped to `[0, 99.9th percentile of target × 3.0]` to block negative and absurd outlier values.
 
 ### Optuna Integration
 
-When `pipeline.n_optuna_trials > 0`, ModelAgent runs an Optuna TPE study for the best single-model algorithm. The search space covers:
+Optuna TPE hyperparameter search is run for **each** enabled algorithm (trial counts come from the LLM model plan; defaults: LightGBM 12, XGBoost 10, CatBoost 6).
+
+**Key design decisions:**
+- **Disjoint tuning fold**: tuning uses a KFold with `random_state = seed + 7919` so the tuning validation fold never coincides with any CV validation fold, eliminating optimistic bias.
+- **Per-algorithm TPE seeds**: `lgbm=seed`, `xgb=seed+1`, `catboost=seed+2` ensure each algorithm explores a different initial region.
+- **Limited tuning folds**: only the first 2 folds per trial are used (`_MAX_TUNE_FOLDS = 2`) to limit tuning time.
+
+The search space covers:
 - `learning_rate`: [0.01, 0.3] log-scale
-- `max_depth` / `num_leaves`: integer ranges
-- `subsample`, `colsample_bytree`: [0.6, 1.0]
-- `reg_alpha`, `reg_lambda`: [1e-8, 10.0] log-scale
+- `max_depth` / `num_leaves` / `depth`: integer ranges
+- `subsample` / `feature_fraction` / `colsample_bytree`: [0.5, 1.0]
+- `reg_alpha`, `reg_lambda` / `l2_leaf_reg`: [1e-8, 10.0] log-scale
+- `min_child_samples`: [20, 200] (LightGBM only)
 
 ---
 

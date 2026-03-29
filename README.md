@@ -48,6 +48,7 @@ graph TD
     Orchestrator -- "ACCEPT" --> END
     Orchestrator -- "IMPROVE → feature" --> feature_rag
     Orchestrator -- "IMPROVE → model" --> model_rag
+    Orchestrator -- "IMPROVE → data" --> data_rag
 ```
 
 ---
@@ -125,14 +126,18 @@ Configuration is managed by [Hydra](https://hydra.cc/). The main config is `conf
 ### LLM Provider Switching
 
 ```bash
-# Groq (default — free, fast)
+# OpenRouter (default — free Nvidia model, access to many providers)
 python main.py
+
+# Groq (free, very fast)
+python main.py llm=groq
 
 # HuggingFace Inference API
 python main.py llm=huggingface
 
-# OpenRouter (access to GPT-4o, Claude, Gemini, etc.)
-python main.py llm=openrouter
+# Local model on Kaggle 2×T4 GPUs (4-bit NF4 quantization)
+python main.py llm=local_hf
+python main.py llm=local_hf llm.model=Qwen/Qwen3-80B-A3B-Instruct
 ```
 
 ### Pipeline Mode
@@ -160,12 +165,11 @@ python main.py pipeline.enable_guardrails=false
 # Disable specific models
 python main.py models.catboost.enabled=false
 
-# Enable Optuna hyperparameter search (50 trials)
-python main.py pipeline.n_optuna_trials=50
-
 # Custom output directory
 python main.py project.output_dir=./my_outputs
 ```
+
+Optuna trial counts are determined per-algorithm by the LLM model plan (defaults: LightGBM 12, XGBoost 10, CatBoost 6).
 
 ### Full Config Reference
 
@@ -268,19 +272,21 @@ rag:
 | **FeatureAgent** | Feature engineering | Selects feature groups & parameters | sklearn, scipy |
 | **ModelAgent** | Model training | Suggests hyperparameter hints | LightGBM, XGBoost, CatBoost, Optuna |
 | **EvaluatorAgent** | Evaluation & metrics | Interprets OOF MSE results | numpy metrics |
-| **OrchestratorAgent** | Feedback loop control | Decides ACCEPT or IMPROVE with target agent | LangGraph routing |
+| **OrchestratorAgent** | Feedback loop control | Decides ACCEPT or IMPROVE with target agent; adaptive early stop (<1% improvement) | LangGraph routing |
 
 **Feature groups built by FeatureAgent:**
 
 | Group | Features produced |
 |---|---|
-| Datetime | `dt_year`, `dt_month`, `dt_day_of_week`, `dt_is_weekend`, `dt_quarter`, `dt_days_since_review` |
-| Geo | `geo_cluster` (KMeans), `geo_dist_center` (haversine km) |
-| Text | `text_name_svd_0..N`, `text_location_svd_0..N` (TF-IDF + SVD) |
-| Target encoding | `te_host_name`, `te_location_cluster`, `te_type_house` (smoothed mean) |
+| Datetime | `dt_year`, `dt_month`, `dt_day_of_week`, `dt_is_weekend`, `dt_quarter`, `dt_days_since_review` (relative to fixed 2026-01-01 reference date) |
+| Geo | `geo_cluster` (KMeans), `geo_dist_center` (haversine km), `geo_dist_cluster` (distance to assigned centroid) |
+| Text | `text_name_svd_0..N`, `text_location_svd_0..N` (TF-IDF + TruncatedSVD) |
+| Target encoding | `te_host_name`, `te_location_cluster`, `te_type_house` (smoothed mean, applied inside each CV fold by ModelAgent to prevent leakage) |
 | Frequency encoding | `freq_host_name`, `freq_location_cluster`, `freq_type_house` |
-| Interaction | Ratio/product of selected numeric pairs |
-| Scaling | StandardScaler applied to all numeric features |
+| Interaction | `inter_*` — pairwise products of selected numeric pairs |
+| Ratio | `ratio_*` — pairwise ratios of selected numeric pairs |
+| Log transforms | `log_*` — log1p of right-skewed columns (`sum`, `min_days`, `amt_reviews`, `total_host`) |
+| Label encoding | `le_*` — ordinal encoding for categoricals (`type_house`, `location_cluster`) |
 
 ---
 
@@ -432,7 +438,8 @@ kaggle-mas/
 │   └── dashboard.py               # MetricsDashboard (PNG plots)
 │
 ├── utils/
-│   ├── llm_client.py              # Unified LLM client (Groq/HF/OpenRouter)
+│   ├── llm_client.py              # Unified LLM client (Groq/HF/OpenRouter/Local)
+│   ├── local_llm_client.py        # Local HF model loading (4-bit NF4, multi-GPU)
 │   ├── logger.py                  # Logger + TokenTracker
 │   └── helpers.py                 # set_seed, safe_json_parse, etc.
 │
@@ -441,7 +448,8 @@ kaggle-mas/
 │   ├── llm/
 │   │   ├── groq.yaml
 │   │   ├── huggingface.yaml
-│   │   └── openrouter.yaml
+│   │   ├── openrouter.yaml
+│   │   └── local_hf.yaml          # Local model (4-bit, Kaggle 2×T4)
 │   └── pipeline/
 │       ├── default.yaml
 │       └── fast.yaml
