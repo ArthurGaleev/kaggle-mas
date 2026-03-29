@@ -500,9 +500,17 @@ def run_pipeline(cfg: DictConfig) -> Dict[str, Any]:
     # ------------------------------------------------------------------
     enable_rag = bool(OmegaConf.select(cfg, "pipeline.enable_rag", default=True))
     if enable_rag:
-        kb_path = OmegaConf.select(cfg, "rag.knowledge_base_path", default="./rag/knowledge_base")
-        knowledge_base = KnowledgeBase(cfg)
-        knowledge_base.build(force_rebuild=False)
+        embedding_model = OmegaConf.select(
+            cfg, "rag.embedding_model", default="all-MiniLM-L6-v2",
+        )
+        knowledge_base = KnowledgeBase(model_name=embedding_model)
+        knowledge_base.load_builtin_knowledge()
+        # Also load custom knowledge files if the directory exists
+        kb_path = OmegaConf.select(
+            cfg, "rag.knowledge_base_path", default="./rag/knowledge_base",
+        )
+        if os.path.isdir(kb_path):
+            knowledge_base.load_from_directory(kb_path)
         rag_retriever = RAGRetriever(knowledge_base, llm_client)
         logger.info("RAG enabled — knowledge base size: %d chunks.", len(knowledge_base))
     else:
