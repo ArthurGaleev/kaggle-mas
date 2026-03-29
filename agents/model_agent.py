@@ -316,9 +316,10 @@ Respond with JSON only.
         fixed: Dict[str, Any],
     ) -> Tuple[Any, float]:
         merged = {**fixed, **params}
-        # CatBoost does not handle NaN natively like LightGBM/XGBoost — fill with sentinel
-        X_train = np.where(np.isnan(X_train), -999.0, X_train)
-        X_val = np.where(np.isnan(X_val), -999.0, X_val)
+        # CatBoost handles NaN natively (since v0.22) with optimal split
+        # direction learning.  Using a -999 sentinel instead forces the model
+        # to treat NaN as an actual numeric value, creating spurious splits
+        # and degrading prediction quality.
         model = ModelTools.train_catboost(X_train, y_train, X_val, y_val, merged)
         val_pred = np.asarray(model.predict(X_val))
         return model, float(mean_squared_error(y_val, val_pred))
