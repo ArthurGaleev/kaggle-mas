@@ -431,3 +431,132 @@ Respond with JSON only.
             test[f"le_{col}"] = le.transform(test[col].astype(str))
 
         return train, test
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Ask the LLM for a feature plan, execute it, validate, and store results.
+
+        Target encoding columns (host_name, location_cluster, type_house) are
+        kept as raw object columns in the output DataFrames. ModelAgent will
+        apply the actual encoding inside each CV fold to prevent leakage.
+        """
+        # --- Pull DataFrames from state ---
+        train: pd.DataFrame = state["train_df"].copy()
+        test: pd.DataFrame = state["test_df"].copy()
+
+        # Separate target and IDs before feature engineering
+        target = train.pop(self.TARGET_COL)
+        test_ids = test[self.ID_COL].copy()
+
+        # Drop ID from features (not predictive)
+        train.drop(columns=[self.ID_COL], inplace=True, errors="ignore")
+        test.drop(columns=[self.ID_COL], inplace=True, errors="ignore")
+
+        # --- Get LLM plan ---
+        plan = self._request_feature_plan(state)
+        state["feature_plan"] = plan
+        groups = plan.get("groups", {})
+        self._log(f"Feature plan enabled groups: "
+                  f"{[g for g, cfg in groups.items() if cfg.get('enabled')]}")
+
+        # --- Execute each feature group ---
+        if groups.get("datetime_features", {}).get("enabled", True):
+            train, test = self._add_datetime_features(train, test)
+
+        if groups.get("geo_features", {}).get("enabled", True):
+            n_clusters = groups["geo_features"].get("n_clusters", 8)
+            train, test = self._add_geo_features(train, test, n_clusters=n_clusters)
+
+        if groups.get("text_features", {}).get("enabled", True):
+            n_comp = groups.get("text_features", {}).get("n_components", 5)
+            max_feat = groups.get("text_features", {}).get("max_features", 300)
+            train, test = self._add_text_features(
+                train, test, n_components=n_comp, max_features=max_feat
+            )
+
+        # Target encoding: do NOT apply here. Keep raw categorical columns
+        # so ModelAgent can apply fold-level encoding (no leakage).
+
+        if groups.get("frequency_encoding", {}).get("enabled", True):
+            train, test = self._add_frequency_encoding(train, test)
+
+        if groups.get("interaction_features", {}).get("enabled", True):
+            pairs = groups.get("interaction_features", {}).get("pairs")
+            train, test = self._add_interaction_features(train, test, pairs=pairs)
+
+        if groups.get("log_transforms", {}).get("enabled", True):
+            log_cols = groups.get("log_transforms", {}).get("columns")
+            train, test = self._add_log_transforms(train, test, columns=log_cols)
+
+        if groups.get("label_encoding", {}).get("enabled", True):
+            le_cols = groups.get("label_encoding", {}).get("columns")
+            train, test = self._add_label_encoding(train, test, columns=le_cols)
+
+        # --- Drop remaining object columns EXCEPT target-encoding placeholders ---
+        te_keep = set(self.TARGET_ENCODE_COLS)
+        obj_cols_train = train.select_dtypes(include="object").columns.tolist()
+        obj_cols_test = test.select_dtypes(include="object").columns.tolist()
+        drop_obj = list(set(obj_cols_train + obj_cols_test) - te_keep)
+        if drop_obj:
+            self._log(f"Dropping remaining object columns: {drop_obj}", level="warning")
+            train.drop(columns=[c for c in drop_obj if c in train.columns], inplace=True)
+            test.drop(columns=[c for c in drop_obj if c in test.columns], inplace=True)
+
+        # Also drop datetime-type columns if any remain
+        dt_cols = train.select_dtypes(include=["datetime64"]).columns.tolist()
+        if dt_cols:
+            train.drop(columns=dt_cols, inplace=True, errors="ignore")
+            test.drop(columns=[c for c in dt_cols if c in test.columns],
+                      inplace=True, errors="ignore")
+
+        # --- Align train/test columns ---
+        common_cols = [c for c in train.columns if c in test.columns]
+        train_only = [c for c in train.columns if c not in test.columns]
+        if train_only:
+            self._log(f"Columns in train but not test (dropping): {train_only}",
+                      level="warning")
+        train = train[common_cols]
+        test = test[common_cols]
+
+        # --- Validate guardrail ---
+        if train.shape[1] > self.MAX_FEATURES:
+            self._log(
+                f"Feature count {train.shape[1]} exceeds guardrail {self.MAX_FEATURES}. "
+                "Truncating to top columns by variance.",
+                level="warning",
+            )
+            # Only compute variance on numeric columns
+            num_cols = train.select_dtypes(include=[np.number]).columns
+            variances = train[num_cols].var().sort_values(ascending=False)
+            keep_num = variances.index[: self.MAX_FEATURES].tolist()
+            # Also keep TE placeholder columns
+            keep_te = [c for c in self.TARGET_ENCODE_COLS if c in train.columns]
+            keep_cols = list(dict.fromkeys(keep_num + keep_te))  # dedupe, preserve order
+            train = train[keep_cols]
+            test = test[keep_cols]
+
+        # Scaling is deliberately omitted (see module docstring).
+
+        # Build feature_names from numeric columns only (TE cols are object-dtype
+        # placeholders and are NOT included in feature_names — ModelAgent adds
+        # the encoded versions dynamically inside each fold).
+        feature_names: List[str] = [
+            c for c in train.columns if c not in self.TARGET_ENCODE_COLS
+        ]
+        self._log(f"Final feature count: {len(feature_names)} "
+                  f"(+ {len([c for c in self.TARGET_ENCODE_COLS if c in train.columns])} "
+                  f"TE placeholder cols)")
+
+        # --- Store in state ---
+        state["train_feat"] = train
+        state["test_feat"] = test
+        state["target_series"] = target
+        state["test_ids"] = test_ids
+        state["feature_names"] = feature_names
+
+        gc.collect()
+        return state
