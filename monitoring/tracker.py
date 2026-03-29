@@ -50,6 +50,11 @@ class PipelineTracker:
     >>> tracker.log_agent_action("DataAgent", "impute_missing", {"cols": 3})
     >>> tracker.end_phase("data_cleaning", "success", {"rows_cleaned": 1000})
     >>> report = tracker.get_summary()
+
+    Loading a saved report
+    ----------------------
+    >>> tracker = PipelineTracker.load("outputs/pipeline_report.json")
+    >>> summary = tracker.get_summary()
     """
 
     def __init__(self) -> None:
@@ -67,6 +72,67 @@ class PipelineTracker:
         self._llm_total_latency: float = 0.0
 
         logger.info("PipelineTracker initialised at %s", self._start_wall)
+
+    # ------------------------------------------------------------------
+    # Deserialization
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def load(cls, path: str) -> "PipelineTracker":
+        """Load a tracker from a previously saved JSON report.
+
+        Reconstructs the tracker object from the JSON file produced by
+        :meth:`save_report`, restoring all events and aggregate LLM counters
+        so that :meth:`get_summary` works correctly on the reloaded instance.
+
+        Parameters
+        ----------
+        path:
+            File path of the JSON report produced by :meth:`save_report`.
+
+        Returns
+        -------
+        PipelineTracker
+            A new tracker instance pre-populated with the saved events.
+
+        Raises
+        ------
+        FileNotFoundError
+            If *path* does not exist.
+        json.JSONDecodeError
+            If the file is not valid JSON.
+
+        Example
+        -------
+        >>> tracker = PipelineTracker.load("outputs/pipeline_report.json")
+        >>> print(tracker.get_summary()["phase_durations_s"])
+        """
+        out_path = Path(path)
+        with open(out_path, "r", encoding="utf-8") as f:
+            report = json.load(f)
+
+        tracker = cls.__new__(cls)
+        tracker._start_ts = time.monotonic()
+        tracker._start_wall = report.get("run_start", _now_iso())
+        tracker.events = report.get("events", [])
+        tracker._phase_starts = {}
+
+        # Restore LLM aggregate counters by replaying events
+        tracker._llm_calls = 0
+        tracker._llm_prompt_tokens = 0
+        tracker._llm_completion_tokens = 0
+        tracker._llm_total_latency = 0.0
+        for evt in tracker.events:
+            if evt.get("type") == EVT_LLM_CALL:
+                tracker._llm_calls += 1
+                tracker._llm_prompt_tokens += evt.get("prompt_tokens", 0)
+                tracker._llm_completion_tokens += evt.get("completion_tokens", 0)
+                tracker._llm_total_latency += evt.get("latency_s", 0.0)
+
+        logger.info(
+            "PipelineTracker loaded from %s (%d events)", out_path, len(tracker.events)
+        )
+        return tracker
 
     # ------------------------------------------------------------------
     # Phase tracking
