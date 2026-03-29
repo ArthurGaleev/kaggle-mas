@@ -5,13 +5,15 @@ plan, optimises with Optuna, and creates a weighted ensemble.
 The LLM is consulted only to reason about which models to enable and which
 parameter search-space adjustments are appropriate for the dataset size and
 type. All training and tuning code is deterministic Python.
+
+GPU handling is centralised in ``tools.model_tools.ModelTools``:
+  - ``gpu_available()``  — cached CUDA probe + OpenCL ICD setup for LightGBM
+  - ``ModelTools.train_lightgbm/xgboost/catboost`` — inject the correct
+    device/tree_method/task_type param and fall back to CPU transparently.
 """
 
 import gc
-import json
 import logging
-import os
-import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,83 +27,10 @@ from sklearn.model_selection import KFold
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 from agents.base import BaseAgent
+from tools.model_tools import ModelTools, gpu_available
 from utils.helpers import safe_json_parse
 
 _logger = logging.getLogger("kaggle-mas.model_agent")
-
-
-# ---------------------------------------------------------------------------
-# GPU detection helpers
-# ---------------------------------------------------------------------------
-
-def _gpu_available() -> bool:
-    """Return True if a CUDA GPU is accessible."""
-    # Fast path: use torch if it is already imported
-    try:
-        import torch
-        return torch.cuda.is_available()
-    except ImportError:
-        pass
-    # Fallback: probe nvidia-smi (works in Colab/Kaggle without torch)
-    try:
-        subprocess.run(
-            ["nvidia-smi"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-            timeout=5,
-        )
-        return True
-    except Exception:
-        return False
-
-
-def _gpu_params(algo: str) -> Dict[str, Any]:
-    """
-    Return the library-specific params required to run *algo* on the GPU.
-
-    Falls back to CPU params silently so the pipeline still works on
-    machines without a CUDA GPU (e.g. local dev boxes).
-
-    Parameters
-    ----------
-    algo : str
-        One of ``"lightgbm"``, ``"xgboost"``, ``"catboost"``.
-
-    Returns
-    -------
-    dict
-        Params dict to be merged into the model's fixed params.
-    """
-    if not _gpu_available():
-        _logger.info("[GPU] No CUDA GPU detected — running %s on CPU.", algo)
-        if algo == "xgboost":
-            return {"tree_method": "hist"}
-        if algo == "catboost":
-            return {"task_type": "CPU"}
-        return {}  # LightGBM defaults to CPU without device param
-
-    _logger.info("[GPU] CUDA GPU detected — configuring %s for GPU.", algo)
-
-    if algo == "lightgbm":
-        return {"device": "gpu"}
-
-    if algo == "xgboost":
-        # XGBoost ≥2.0 uses `device='cuda'`; older versions use `tree_method='gpu_hist'`.
-        try:
-            import xgboost as xgb
-            major = int(xgb.__version__.split(".")[0])
-            if major >= 2:
-                return {"device": "cuda"}
-            else:
-                return {"tree_method": "gpu_hist"}
-        except Exception:
-            return {"device": "cuda"}
-
-    if algo == "catboost":
-        return {"task_type": "GPU"}
-
-    return {}
 
 
 class ModelAgent(BaseAgent):
@@ -296,7 +225,7 @@ Respond with JSON only.
         return params
 
     # ------------------------------------------------------------------
-    # Model training helpers
+    # Model training helpers — delegate to ModelTools for GPU + training
     # ------------------------------------------------------------------
 
     def _train_lightgbm(
@@ -308,32 +237,13 @@ Respond with JSON only.
         params: Dict[str, Any],
         fixed: Dict[str, Any],
     ) -> Tuple[Any, float]:
-        import lightgbm as lgb
-
-        # Merge GPU params; allow explicit override from plan (e.g. device='cpu')
-        gpu = _gpu_params("lightgbm")
-        merged = {**gpu, **fixed, **params}
-        n_est = merged.pop("n_estimators", 1000)
-        es = merged.pop("early_stopping_rounds", 50)
-
-        dtrain = lgb.Dataset(X_train, label=y_train)
-        dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
-
-        callbacks = [
-            lgb.early_stopping(stopping_rounds=es, verbose=False),
-            lgb.log_evaluation(period=-1),
-        ]
-        merged["metric"] = "mse"
-        model = lgb.train(
-            merged,
-            dtrain,
-            num_boost_round=n_est,
-            valid_sets=[dval],
-            callbacks=callbacks,
-        )
+        # Merge: fixed params first, then Optuna trial params on top.
+        # ModelTools.train_lightgbm will inject device='gpu' if GPU is available
+        # and 'device' is not already present in the merged dict.
+        merged = {**fixed, **params}
+        model = ModelTools.train_lightgbm(X_train, y_train, X_val, y_val, merged)
         val_pred = model.predict(X_val)
-        val_mse = mean_squared_error(y_val, val_pred)
-        return model, val_mse
+        return model, float(mean_squared_error(y_val, val_pred))
 
     def _train_xgboost(
         self,
@@ -344,27 +254,13 @@ Respond with JSON only.
         params: Dict[str, Any],
         fixed: Dict[str, Any],
     ) -> Tuple[Any, float]:
+        # ModelTools.train_xgboost injects device='cuda' (or tree_method='gpu_hist'
+        # for XGBoost <2.0) when GPU is available and neither key is already present.
+        merged = {**fixed, **params}
+        booster = ModelTools.train_xgboost(X_train, y_train, X_val, y_val, merged)
         import xgboost as xgb
-
-        # Merge GPU params first so explicit plan values can override
-        gpu = _gpu_params("xgboost")
-        # Remove any conflicting CPU key from fixed before merging
-        fixed_clean = {k: v for k, v in fixed.items()
-                       if k not in ("tree_method", "device") or k in gpu}
-        merged = {**gpu, **fixed_clean, **params}
-        n_est = merged.pop("n_estimators", 1000)
-        es = merged.pop("early_stopping_rounds", 50)
-
-        merged["eval_metric"] = "rmse"
-        model = xgb.XGBRegressor(n_estimators=n_est, early_stopping_rounds=es, **merged)
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_val, y_val)],
-            verbose=False,
-        )
-        val_pred = model.predict(X_val)
-        val_mse = mean_squared_error(y_val, val_pred)
-        return model, val_mse
+        val_pred = booster.predict(xgb.DMatrix(X_val))
+        return booster, float(mean_squared_error(y_val, val_pred))
 
     def _train_catboost(
         self,
@@ -375,21 +271,12 @@ Respond with JSON only.
         params: Dict[str, Any],
         fixed: Dict[str, Any],
     ) -> Tuple[Any, float]:
-        from catboost import CatBoostRegressor, Pool
-
-        # Merge GPU params; allow explicit plan override
-        gpu = _gpu_params("catboost")
-        merged = {**gpu, **fixed, **params}
-        model = CatBoostRegressor(**merged)
-        model.fit(
-            X_train, y_train,
-            eval_set=(X_val, y_val),
-            use_best_model=True,
-            verbose=False,
-        )
-        val_pred = model.predict(X_val)
-        val_mse = mean_squared_error(y_val, val_pred)
-        return model, val_mse
+        # ModelTools.train_catboost injects task_type='GPU' when GPU is available
+        # and 'task_type' is not already set.
+        merged = {**fixed, **params}
+        model = ModelTools.train_catboost(X_train, y_train, X_val, y_val, merged)
+        val_pred = np.asarray(model.predict(X_val))
+        return model, float(mean_squared_error(y_val, val_pred))
 
     # ------------------------------------------------------------------
     # Optuna tuning per algorithm
@@ -568,8 +455,8 @@ Respond with JSON only.
         test_ids: pd.Series = state["test_ids"]
         feature_names: List[str] = state["feature_names"]
 
-        # Log GPU status once at the start
-        _logger.info("[GPU] GPU available: %s", _gpu_available())
+        # Log GPU status once at the start (uses cached check from ModelTools)
+        _logger.info("[GPU] GPU available: %s", gpu_available())
 
         # --- LLM plan ---
         plan = self._request_model_plan(state)
