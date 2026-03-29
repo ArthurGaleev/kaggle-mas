@@ -168,11 +168,15 @@ class FeatureAgent(BaseAgent):
         """
         profile = state.get("data_profile", {})
         train_shape = profile.get("train", {}).get("shape", ["?", "?"])
+        improvement_hints = state.get("improvement_plan", {}).get("feature_hints", "")
 
         prompt = f"""
 You are engineering features for a Kaggle rental-property regression task.
 Target: 'target' (rental price, numeric). Metric: MSE.
 Train shape after cleaning: {train_shape}.
+
+## Improvement hints from previous iteration
+{improvement_hints or "None — first run."}
 
 ## Column descriptions
 {json.dumps(self.COLUMN_ROLES, indent=2)}
