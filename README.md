@@ -70,13 +70,13 @@ graph TD
 ### Requirements
 
 - Python ≥ 3.10
-- One LLM provider key (Groq free tier recommended)
+- One LLM provider key (OpenRouter free large Nvidia model recommended)
 
 ### Local setup
 
 ```bash
 # 1. Clone
-git clone https://github.com/YOUR_USERNAME/kaggle-mas.git
+git clone https://github.com/ArthurGaleev/kaggle-mas.git
 cd kaggle-mas
 
 # 2. Create virtual environment
@@ -453,8 +453,7 @@ kaggle-mas/
 │   └── test_pipeline.py
 │
 ├── notebooks/
-│   ├── run_colab.py               # Google Colab notebook (cell-marked)
-│   └── run_kaggle.py              # Kaggle Kernel notebook
+│   └── demo.ipynb               # Google Colab notebook (cell-marked)
 │
 ├── docs/
 │   └── ARCHITECTURE.md            # Detailed architecture documentation
@@ -488,7 +487,7 @@ MIT License. See [LICENSE](LICENSE) for details.
 ```
 MIT License
 
-Copyright (c) 2026 YOUR_USERNAME
+Copyright (c) 2026 ArthurGaleev
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
