@@ -57,7 +57,7 @@ from omegaconf import DictConfig
 from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 from agents.base import BaseAgent
 from utils.helpers import safe_json_parse
@@ -275,13 +275,21 @@ Respond with JSON only.
         train_coords = train[[lat_col, lon_col]].fillna(0).values
         test_coords = test[[lat_col, lon_col]].fillna(0).values
 
+        # Standardize coordinates before KMeans — lat and lon have different
+        # scales, biasing raw clustering toward whichever has larger range.
+        scaler = StandardScaler()
+        train_coords_scaled = scaler.fit_transform(train_coords)
+        test_coords_scaled = scaler.transform(test_coords)
+
         kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        kmeans.fit(train_coords)
+        kmeans.fit(train_coords_scaled)
 
-        train["geo_cluster"] = kmeans.predict(train_coords)
-        test["geo_cluster"] = kmeans.predict(test_coords)
+        train["geo_cluster"] = kmeans.predict(train_coords_scaled)
+        test["geo_cluster"] = kmeans.predict(test_coords_scaled)
 
-        centers = kmeans.cluster_centers_
+        # Cluster centers in original coordinate space (for distance features)
+        centers_orig = scaler.inverse_transform(kmeans.cluster_centers_)
+
         city_lat = float(np.mean(train[lat_col].dropna()))
         city_lon = float(np.mean(train[lon_col].dropna()))
 
@@ -302,6 +310,15 @@ Respond with JSON only.
             test[lon_col].fillna(city_lon).values,
             city_lat, city_lon,
         )
+
+        # Distance to assigned cluster centroid (captures within-neighbourhood position)
+        for df_name, df, coords in [("train", train, train_coords), ("test", test, test_coords)]:
+            cluster_labels = df["geo_cluster"].values
+            centroid_lats = centers_orig[cluster_labels, 0]
+            centroid_lons = centers_orig[cluster_labels, 1]
+            df["geo_dist_cluster"] = np.sqrt(
+                (coords[:, 0] - centroid_lats) ** 2 + (coords[:, 1] - centroid_lons) ** 2
+            )
 
         return train, test
 
