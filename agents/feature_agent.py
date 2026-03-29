@@ -202,7 +202,7 @@ Schema:
   "groups": {{
     "datetime_features":    {{"enabled": true}},
     "geo_features":         {{"enabled": true, "n_clusters": 8}},
-    "text_features":        {{"enabled": true, "n_components": 5, "max_features": 300}},
+    "text_features":        {{"enabled": true, "n_components": 10, "max_features": 500}},
     "target_encoding":      {{"enabled": true, "smoothing": 10}},
     "frequency_encoding":   {{"enabled": true}},
     "interaction_features": {{"enabled": true, "pairs": [["sum", "min_days"], ["amt_reviews", "avg_reviews"]]}},
@@ -218,7 +218,7 @@ Respond with JSON only.
             "groups": {
                 "datetime_features":    {"enabled": True},
                 "geo_features":         {"enabled": True, "n_clusters": 8},
-                "text_features":        {"enabled": True, "n_components": 5, "max_features": 300},
+                "text_features":        {"enabled": True, "n_components": 10, "max_features": 500},
                 "target_encoding":      {"enabled": True, "smoothing": 10},
                 "frequency_encoding":   {"enabled": True},
                 "interaction_features": {
