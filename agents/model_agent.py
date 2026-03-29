@@ -390,10 +390,13 @@ Respond with JSON only.
         self,
         algo: str,
         algo_cfg: Dict[str, Any],
-        X: np.ndarray,
+        X_df: pd.DataFrame,
         y: np.ndarray,
         seed: int,
         n_splits: int,
+        feature_names: List[str],
+        te_smoothing: float = 10.0,
+        global_mean: float = 0.0,
     ) -> Dict[str, Any]:
         """
         Run Optuna to find best hyperparameters for one algorithm.
@@ -402,6 +405,10 @@ Respond with JSON only.
         tuning validation split is *disjoint* from all CV folds (which use
         ``random_state=seed``).  This eliminates the optimistic bias that
         occurs when the tuning fold coincides with a later CV validation fold.
+
+        Target encoding is applied inside the tuning fold to match the CV
+        feature space, preventing feature-count mismatches between tuning
+        and final CV training.
         """
         search_space = algo_cfg.get("search_space", {})
         fixed = algo_cfg.get("fixed_params", {})
@@ -416,13 +423,27 @@ Respond with JSON only.
         # Use a different random_state than the CV loop to get a disjoint
         # validation fold, preventing optimistic bias in tuned params.
         tune_kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed + _TUNE_SEED_OFFSET)
-        tune_train_idx, tune_val_idx = next(iter(tune_kf.split(X)))
-        X_t, y_t = X[tune_train_idx], y[tune_train_idx]
-        X_v, y_v = X[tune_val_idx], y[tune_val_idx]
 
         def objective(trial: optuna.Trial) -> float:
             params = self._sample_params(trial, search_space)
             try:
+                tune_train_idx, tune_val_idx = next(iter(tune_kf.split(X_df)))
+                train_fold_df = X_df.iloc[tune_train_idx].reset_index(drop=True)
+                val_fold_df = X_df.iloc[tune_val_idx].reset_index(drop=True)
+                y_t = y[tune_train_idx]
+                y_v = y[tune_val_idx]
+
+                # Apply fold-level target encoding to match CV feature space
+                X_t, X_v, _, _ = self._apply_fold_target_encoding(
+                    train_df=train_fold_df,
+                    val_df=val_fold_df,
+                    test_df=val_fold_df,  # dummy, not used
+                    target_fold=y_t,
+                    global_mean=global_mean,
+                    smoothing=te_smoothing,
+                    feature_names=feature_names,
+                )
+
                 _, mse = train_fn(X_t, y_t, X_v, y_v, params, dict(fixed))
                 return mse
             except Exception as exc:
@@ -673,9 +694,13 @@ Respond with JSON only.
             self._log(f"Tuning {algo} with Optuna ({algo_cfg.get('n_trials', 20)} trials)\u2026")
 
             try:
-                # Pass pure-numeric X for Optuna (TE not needed here — disjoint fold)
+                # Pass X_df (with TE placeholder cols) so Optuna tunes on the
+                # same feature space as CV training (fold-level TE applied inside).
                 best_params = self._tune_algorithm(
-                    algo, algo_cfg, X_numeric, y, seed, n_splits
+                    algo, algo_cfg, X_df, y, seed, n_splits,
+                    feature_names=feature_names,
+                    te_smoothing=te_smoothing,
+                    global_mean=global_mean,
                 )
             except Exception as exc:
                 self._log(f"Optuna tuning failed for {algo}: {exc}. Using fixed params.", level="warning")
