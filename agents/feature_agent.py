@@ -90,39 +90,34 @@ You are engineering features for a Kaggle rental-property regression task.
 Target: 'target' (rental price, numeric). Metric: MSE.
 Train shape after cleaning: {train_shape}.
 
-IMPORTANT: The target variable is right-skewed. The ModelAgent will apply
-log1p to the target before training and expm1 after prediction — this is
-already handled. Your job is to maximize feature quality for the model.
-
 ## Column descriptions
 {json.dumps(self.COLUMN_ROLES, indent=2)}
 
 ## Available feature groups
 1. datetime_features   — extract year/month/day_of_week/is_weekend/days_since_last_review from 'last_dt'
-2. geo_features        — KMeans geo-clusters from lat/lon (use 30 clusters); haversine distance to city centroid
-3. text_features       — TF-IDF + SVD on 'name' and 'location' columns (use 20 SVD components, 1000 max vocab)
-4. target_encoding     — target-mean encoding for 'host_name', 'location_cluster', 'type_house', 'geo_cluster'
+2. geo_features        — KMeans geo-clusters from lat/lon; haversine distance to city centroid
+3. text_features       — TF-IDF + SVD on 'name' and 'location' columns (low-dimensional)
+4. target_encoding     — target-mean encoding for 'host_name', 'location_cluster', 'type_house'
 5. frequency_encoding  — count/frequency encoding for high-cardinality categoricals
 6. interaction_features — pairwise products of key numeric pairs
-7. log_transforms      — log1p of right-skewed numeric columns (do NOT log the target — ModelAgent handles that)
+7. log_transforms      — log1p of right-skewed numeric columns
 8. polynomial_features — degree-2 polynomial of top numeric features (careful with memory)
 9. label_encoding      — ordinal label encoding for categoricals
 
 ## Instructions
 Return a JSON plan (no markdown, strict JSON). Enable only the groups that are likely
 to improve MSE on this dataset. Keep total feature count under {self.MAX_FEATURES}.
-Use 30 geo clusters and 20 SVD text components for richer representations.
 
 Schema:
 {{
   "groups": {{
     "datetime_features":    {{"enabled": true}},
-    "geo_features":         {{"enabled": true, "n_clusters": 30}},
-    "text_features":        {{"enabled": true, "n_components": 20, "max_features": 1000}},
+    "geo_features":         {{"enabled": true, "n_clusters": 8}},
+    "text_features":        {{"enabled": true, "n_components": 5, "max_features": 300}},
     "target_encoding":      {{"enabled": true, "smoothing": 10}},
     "frequency_encoding":   {{"enabled": true}},
-    "interaction_features": {{"enabled": true, "pairs": [["sum", "min_days"], ["amt_reviews", "avg_reviews"], ["total_host", "amt_reviews"]]}},
-    "log_transforms":       {{"enabled": true, "columns": ["sum", "min_days", "amt_reviews", "total_host", "avg_reviews"]}},
+    "interaction_features": {{"enabled": true, "pairs": [["sum", "min_days"], ["amt_reviews", "avg_reviews"]]}},
+    "log_transforms":       {{"enabled": true, "columns": ["sum", "min_days", "amt_reviews", "total_host"]}},
     "polynomial_features":  {{"enabled": false}},
     "label_encoding":       {{"enabled": true, "columns": ["type_house", "location_cluster"]}}
   }},
@@ -134,19 +129,15 @@ Respond with JSON only.
         default: Dict[str, Any] = {
             "groups": {
                 "datetime_features":    {"enabled": True},
-                "geo_features":         {"enabled": True, "n_clusters": 30},
-                "text_features":        {"enabled": True, "n_components": 20, "max_features": 1000},
+                "geo_features":         {"enabled": True, "n_clusters": 8},
+                "text_features":        {"enabled": True, "n_components": 5, "max_features": 300},
                 "target_encoding":      {"enabled": True, "smoothing": 10},
                 "frequency_encoding":   {"enabled": True},
                 "interaction_features": {
                     "enabled": True,
-                    "pairs": [
-                        ["sum", "min_days"],
-                        ["amt_reviews", "avg_reviews"],
-                        ["total_host", "amt_reviews"],
-                    ],
+                    "pairs": [["sum", "min_days"], ["amt_reviews", "avg_reviews"]],
                 },
-                "log_transforms":       {"enabled": True, "columns": ["sum", "min_days", "amt_reviews", "total_host", "avg_reviews"]},
+                "log_transforms":       {"enabled": True, "columns": ["sum", "min_days", "amt_reviews", "total_host"]},
                 "polynomial_features":  {"enabled": False},
                 "label_encoding":       {"enabled": True, "columns": ["type_house", "location_cluster"]},
             },
@@ -184,7 +175,7 @@ Respond with JSON only.
         self,
         train: pd.DataFrame,
         test: pd.DataFrame,
-        n_clusters: int = 30,
+        n_clusters: int = 8,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """KMeans geo-clusters + haversine distance to centroid."""
         lat_col, lon_col = "lat", "lon"
@@ -229,8 +220,8 @@ Respond with JSON only.
         self,
         train: pd.DataFrame,
         test: pd.DataFrame,
-        n_components: int = 20,
-        max_features: int = 1000,
+        n_components: int = 5,
+        max_features: int = 300,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """TF-IDF + TruncatedSVD for text columns."""
         text_cols = [c for c in ("name", "location") if c in train.columns]
@@ -271,15 +262,8 @@ Respond with JSON only.
         target: pd.Series,
         smoothing: float = 10.0,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Smoothed target-mean encoding for categorical columns.
-
-        Now includes 'geo_cluster' so neighbourhood-level price signal is
-        directly available as a feature alongside the KMeans cluster label.
-        """
-        cat_cols = [
-            c for c in ("host_name", "location_cluster", "type_house", "geo_cluster")
-            if c in train.columns
-        ]
+        """Smoothed target-mean encoding for categorical columns."""
+        cat_cols = [c for c in ("host_name", "location_cluster", "type_house") if c in train.columns]
         global_mean = float(target.mean())
 
         for col in cat_cols:
@@ -298,11 +282,9 @@ Respond with JSON only.
             train[feat] = train[col].map(mapping).fillna(global_mean)
             test[feat] = test[col].map(mapping).fillna(global_mean)
 
-        # Drop original categoricals that have been encoded
-        # Note: geo_cluster is kept (integer cluster id is also useful for trees)
-        drop_cats = [c for c in ("host_name", "location_cluster", "type_house") if c in train.columns]
-        train.drop(columns=drop_cats, inplace=True)
-        test.drop(columns=[c for c in drop_cats if c in test.columns], inplace=True)
+        # Drop original categorical columns (now encoded)
+        train.drop(columns=[c for c in cat_cols if c in train.columns], inplace=True)
+        test.drop(columns=[c for c in cat_cols if c in test.columns], inplace=True)
 
         return train, test
 
@@ -330,11 +312,7 @@ Respond with JSON only.
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Pairwise product interaction features."""
         if pairs is None:
-            pairs = [
-                ["sum", "min_days"],
-                ["amt_reviews", "avg_reviews"],
-                ["total_host", "amt_reviews"],
-            ]
+            pairs = [["sum", "min_days"], ["amt_reviews", "avg_reviews"]]
 
         for (col_a, col_b) in pairs:
             if col_a in train.columns and col_b in train.columns:
@@ -350,13 +328,9 @@ Respond with JSON only.
         test: pd.DataFrame,
         columns: Optional[List[str]] = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """log1p transform for right-skewed columns.
-
-        NOTE: Do NOT include the target here — ModelAgent applies log1p to the
-        target internally before training and expm1 after prediction.
-        """
+        """log1p transform for right-skewed columns."""
         if columns is None:
-            columns = ["sum", "min_days", "amt_reviews", "total_host", "avg_reviews"]
+            columns = ["sum", "min_days", "amt_reviews", "total_host"]
 
         for col in columns:
             if col in train.columns:
@@ -439,22 +413,20 @@ Respond with JSON only.
             train, test = self._add_datetime_features(train, test)
 
         if groups.get("geo_features", {}).get("enabled", True):
-            n_clusters = groups["geo_features"].get("n_clusters", 30)
+            n_clusters = groups["geo_features"].get("n_clusters", 8)
             train, test = self._add_geo_features(train, test, n_clusters=n_clusters)
 
-        # frequency_encoding must run BEFORE target_encoding so that original
-        # categorical columns are still present when frequency maps are built.
-        if groups.get("frequency_encoding", {}).get("enabled", True):
-            train, test = self._add_frequency_encoding(train, test)
-
         if groups.get("text_features", {}).get("enabled", True):
-            n_comp = groups.get("text_features", {}).get("n_components", 20)
-            max_feat = groups.get("text_features", {}).get("max_features", 1000)
+            n_comp = groups.get("text_features", {}).get("n_components", 5)
+            max_feat = groups.get("text_features", {}).get("max_features", 300)
             train, test = self._add_text_features(train, test, n_components=n_comp, max_features=max_feat)
 
         if groups.get("target_encoding", {}).get("enabled", True):
             smoothing = groups.get("target_encoding", {}).get("smoothing", 10.0)
             train, test = self._add_target_encoding(train, test, target, smoothing=smoothing)
+
+        if groups.get("frequency_encoding", {}).get("enabled", True):
+            train, test = self._add_frequency_encoding(train, test)
 
         if groups.get("interaction_features", {}).get("enabled", True):
             pairs = groups.get("interaction_features", {}).get("pairs")

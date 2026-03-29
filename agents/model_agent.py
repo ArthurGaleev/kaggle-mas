@@ -1,7 +1,6 @@
 """
 ModelAgent — trains gradient-boosting models guided by an LLM hyperparameter
-plan, optimises with Optuna, and creates a weighted ensemble or a stacking
-meta-learner.
+plan, optimises with Optuna, and creates a weighted ensemble.
 
 The LLM is consulted only to reason about which models to enable and which
 parameter search-space adjustments are appropriate for the dataset size and
@@ -11,22 +10,6 @@ GPU handling is centralised in ``tools.model_tools.ModelTools``:
   - ``gpu_available()``  — cached CUDA probe + OpenCL ICD setup for LightGBM
   - ``ModelTools.train_lightgbm/xgboost/catboost`` — inject the correct
     device/tree_method/task_type param and fall back to CPU transparently.
-
-Log-target transformation:
-  - Before any training, the target is transformed with np.log1p so that
-    right-skewed rental prices are modelled in log space.
-  - All OOF and test predictions are inverted with np.expm1 before metrics
-    are computed, so reported MSE/RMSE values are on the original price scale.
-  - The submission CSV also contains the expm1-inverted predictions.
-
-Ensemble methods:
-  - ``inverse_mse``  — weighted average, weight = 1/MSE per algorithm.
-  - ``equal``        — simple average across algorithms.
-  - ``stacking``     — Ridge meta-learner trained on OOF predictions (log
-    space) of all base learners; final test predictions are obtained by
-    applying the meta-learner to the mean test predictions of each base
-    learner, then inverting with expm1.  Falls back to inverse_mse when
-    fewer than 2 algorithms are available.
 """
 
 import gc
@@ -38,7 +21,6 @@ import numpy as np
 import optuna
 import pandas as pd
 from omegaconf import DictConfig, OmegaConf
-from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import KFold
 
@@ -66,29 +48,27 @@ def _xgb_predict(booster: Any, X: np.ndarray) -> np.ndarray:
 class ModelAgent(BaseAgent):
     """
     Trains LightGBM / XGBoost / CatBoost models with Optuna tuning and
-    K-fold cross-validation, then combines them via a weighted ensemble
-    or a Ridge stacking meta-learner.
+    K-fold cross-validation.
 
     Expected state keys consumed:
         train_feat    (pd.DataFrame): engineered feature matrix (train).
         test_feat     (pd.DataFrame): engineered feature matrix (test).
-        target_series (pd.Series):   target values (original scale).
+        target_series (pd.Series):   target values.
         test_ids      (pd.Series):   _id column for submission.
         feature_names (list[str]):   feature column names.
         improvement_plan (dict, opt): hints from OrchestratorAgent.
 
     State keys produced:
         models          (dict):          trained model objects per fold per algorithm.
-        oof_predictions (dict):          out-of-fold predictions per algorithm (original scale).
+        oof_predictions (dict):          out-of-fold predictions per algorithm.
         cv_scores       (dict):          per-fold metrics by model name.
         feature_importances (dict):      mean feature importance per algorithm.
-        ensemble_weights (dict):         weights used for ensemble (or 'stacking' sentinel).
-        ensemble_oof    (np.ndarray):    ensemble OOF predictions (original scale).
-        test_predictions (dict):         test predictions per algorithm (original scale).
-        ensemble_test   (np.ndarray):    final ensemble/stacking test predictions (original scale).
+        ensemble_weights (dict):         weights used for ensemble.
+        ensemble_oof    (np.ndarray):    ensemble OOF predictions.
+        test_predictions (dict):         test predictions per algorithm.
+        ensemble_test   (np.ndarray):    weighted ensemble test predictions.
         submission_df   (pd.DataFrame):  submission-ready DataFrame.
         model_plan      (dict):          LLM-generated model plan.
-        stacking_meta   (Ridge | None):  fitted meta-learner when stacking is used.
     """
 
     SYSTEM_PROMPT = (
@@ -123,18 +103,10 @@ price regression task (Kaggle, MSE metric).
 - xgboost:   GPU-accelerated via device='cuda' (XGBoost >=2.0) or tree_method='gpu_hist' (older)
 - catboost:  strong with categoricals; GPU via task_type='GPU'
 
-## Available ensemble_method values
-- "inverse_mse" — weighted average; weight = 1/OOF-MSE per algorithm (default)
-- "equal"        — simple equal-weight average
-- "stacking"     — Ridge meta-learner trained on OOF predictions; use when >=2
-  algorithms are enabled and the improvement hint mentions stacking or blending
-
 ## Instructions
 Decide which models to enable, how many Optuna trials to run (≤ 30 for notebook
 constraints), and what param ranges to search.  Keep it practical.
 Always include the GPU acceleration parameter for each enabled model.
-Choose "stacking" as ensemble_method only when improvement hints suggest it or
-when >=2 strong models are already tuned and further averaging is unlikely to help.
 
 Return strict JSON only:
 {{
@@ -279,10 +251,8 @@ Respond with JSON only.
     ) -> Tuple[Any, float]:
         merged = {**fixed, **params}
         model = ModelTools.train_lightgbm(X_train, y_train, X_val, y_val, merged)
-        val_pred_log = model.predict(X_val)
-        val_pred = np.expm1(val_pred_log)
-        y_val_orig = np.expm1(y_val)
-        return model, float(mean_squared_error(y_val_orig, val_pred))
+        val_pred = model.predict(X_val)
+        return model, float(mean_squared_error(y_val, val_pred))
 
     def _train_xgboost(
         self,
@@ -295,10 +265,8 @@ Respond with JSON only.
     ) -> Tuple[Any, float]:
         merged = {**fixed, **params}
         booster = ModelTools.train_xgboost(X_train, y_train, X_val, y_val, merged)
-        val_pred_log = _xgb_predict(booster, X_val)
-        val_pred = np.expm1(val_pred_log)
-        y_val_orig = np.expm1(y_val)
-        return booster, float(mean_squared_error(y_val_orig, val_pred))
+        val_pred = _xgb_predict(booster, X_val)
+        return booster, float(mean_squared_error(y_val, val_pred))
 
     def _train_catboost(
         self,
@@ -311,10 +279,8 @@ Respond with JSON only.
     ) -> Tuple[Any, float]:
         merged = {**fixed, **params}
         model = ModelTools.train_catboost(X_train, y_train, X_val, y_val, merged)
-        val_pred_log = np.asarray(model.predict(X_val))
-        val_pred = np.expm1(val_pred_log)
-        y_val_orig = np.expm1(y_val)
-        return model, float(mean_squared_error(y_val_orig, val_pred))
+        val_pred = np.asarray(model.predict(X_val))
+        return model, float(mean_squared_error(y_val, val_pred))
 
     # ------------------------------------------------------------------
     # Optuna tuning per algorithm
@@ -325,13 +291,12 @@ Respond with JSON only.
         algo: str,
         algo_cfg: Dict[str, Any],
         X: np.ndarray,
-        y_log: np.ndarray,
+        y: np.ndarray,
         seed: int,
     ) -> Dict[str, Any]:
         """
         Run Optuna to find best hyperparameters for one algorithm using
         a single validation fold (not full CV, to stay within Colab time budget).
-        y_log is already log1p-transformed.
         """
         search_space = algo_cfg.get("search_space", {})
         fixed = algo_cfg.get("fixed_params", {})
@@ -347,8 +312,8 @@ Respond with JSON only.
         split_idx = int(len(X) * 0.8)
         idx = np.random.default_rng(seed).permutation(len(X))
         tune_train_idx, tune_val_idx = idx[:split_idx], idx[split_idx:]
-        X_t, y_t = X[tune_train_idx], y_log[tune_train_idx]
-        X_v, y_v = X[tune_val_idx], y_log[tune_val_idx]
+        X_t, y_t = X[tune_train_idx], y[tune_train_idx]
+        X_v, y_v = X[tune_val_idx], y[tune_val_idx]
 
         def objective(trial: optuna.Trial) -> float:
             params = self._sample_params(trial, search_space)
@@ -373,7 +338,12 @@ Respond with JSON only.
     def _predict(model: Any, X: np.ndarray) -> np.ndarray:
         """
         Dispatch prediction to the correct API for each model type.
-        Returns raw model output (log space — caller applies expm1).
+
+        - ``xgb.Booster`` requires a ``DMatrix``; passing a raw array raises
+          ``TypeError: Expecting data to be a DMatrix object``.  We detect the
+          Booster type and wrap via :func:`_xgb_predict`.
+        - ``lgb.Booster`` (and sklearn-style models) expose a plain
+          ``predict(array)`` API.
         """
         try:
             import xgboost as xgb
@@ -389,8 +359,7 @@ Respond with JSON only.
         algo_cfg: Dict[str, Any],
         best_params: Dict[str, Any],
         X: np.ndarray,
-        y_log: np.ndarray,
-        y_orig: np.ndarray,
+        y: np.ndarray,
         X_test: np.ndarray,
         n_splits: int,
         seed: int,
@@ -398,11 +367,7 @@ Respond with JSON only.
     ) -> Dict[str, Any]:
         """
         Train the algorithm with best_params across n_splits folds.
-        Returns:
-          - oof_predictions / test_predictions: original price scale (expm1 applied).
-          - oof_predictions_log: log space OOF preds (needed by stacking meta-learner).
-          - test_predictions_log: log space mean test preds (needed by stacking).
-          - fold_mses: per-fold MSE on original scale.
+        Returns OOF preds, fold MSEs, test preds, and feature importances.
         """
         fixed = dict(algo_cfg.get("fixed_params", {}))
         train_fn = {
@@ -412,28 +377,20 @@ Respond with JSON only.
         }[algo]
 
         kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-        oof_preds_orig = np.zeros(len(y_orig))
-        oof_preds_log = np.zeros(len(y_orig))
+        oof_preds = np.zeros(len(y))
         test_preds_folds = np.zeros((len(X_test), n_splits))
         fold_mses: List[float] = []
         models: List[Any] = []
         importances: List[np.ndarray] = []
 
         for fold_idx, (train_idx, val_idx) in enumerate(kf.split(X)):
-            X_tr, y_tr = X[train_idx], y_log[train_idx]
-            X_vl, y_vl_log = X[val_idx], y_log[val_idx]
-            y_vl_orig = y_orig[val_idx]
+            X_tr, y_tr = X[train_idx], y[train_idx]
+            X_vl, y_vl = X[val_idx], y[val_idx]
 
-            model, fold_mse = train_fn(X_tr, y_tr, X_vl, y_vl_log, dict(best_params), dict(fixed))
-
-            # Log-space predictions
-            raw_log = self._predict(model, X_vl)
-            oof_preds_log[val_idx] = raw_log
-            oof_preds_orig[val_idx] = np.expm1(raw_log)
-
-            raw_test_log = self._predict(model, X_test)
-            test_preds_folds[:, fold_idx] = raw_test_log  # keep in log space; mean then expm1
-
+            model, fold_mse = train_fn(X_tr, y_tr, X_vl, y_vl, dict(best_params), dict(fixed))
+            # Use _predict() so xgb.Booster gets a DMatrix, not a raw ndarray
+            oof_preds[val_idx] = self._predict(model, X_vl)
+            test_preds_folds[:, fold_idx] = self._predict(model, X_test)
             fold_mses.append(fold_mse)
             models.append(model)
 
@@ -450,15 +407,10 @@ Respond with JSON only.
         mean_imp = np.mean(importances, axis=0) if importances else np.zeros(len(feature_names))
         imp_dict = dict(zip(feature_names, mean_imp.tolist()))
 
-        # Mean test preds in log space; expm1 for the standard ensemble path
-        test_preds_log_mean = test_preds_folds.mean(axis=1)
-
         return {
             "models": models,
-            "oof_predictions": oof_preds_orig,
-            "oof_predictions_log": oof_preds_log,
-            "test_predictions": np.expm1(test_preds_log_mean),
-            "test_predictions_log": test_preds_log_mean,
+            "oof_predictions": oof_preds,
+            "test_predictions": test_preds_folds.mean(axis=1),
             "fold_mses": fold_mses,
             "mean_cv_mse": float(np.mean(fold_mses)),
             "std_cv_mse": float(np.std(fold_mses)),
@@ -466,7 +418,7 @@ Respond with JSON only.
         }
 
     # ------------------------------------------------------------------
-    # Weighted ensemble
+    # Ensemble
     # ------------------------------------------------------------------
 
     def _build_ensemble(
@@ -478,7 +430,6 @@ Respond with JSON only.
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
         """
         Combine per-algorithm OOF and test predictions into a weighted ensemble.
-        All predictions are in original scale.
         """
         algos = list(oof_results.keys())
         mses = np.array([oof_results[a]["mean_cv_mse"] for a in algos])
@@ -503,86 +454,7 @@ Respond with JSON only.
         return oof_ensemble, test_ensemble, weight_dict
 
     # ------------------------------------------------------------------
-    # Stacking meta-learner
-    # ------------------------------------------------------------------
-
-    def _build_stacking_ensemble(
-        self,
-        oof_results: Dict[str, Dict[str, Any]],
-        y_log: np.ndarray,
-        y_orig: np.ndarray,
-        seed: int = 42,
-    ) -> Tuple[np.ndarray, np.ndarray, Ridge]:
-        """
-        Train a Ridge meta-learner on out-of-fold log-space predictions from
-        all base learners, then apply it to their mean test-set log-space
-        predictions.
-
-        The meta-learner operates entirely in log space so its inputs are on
-        a similar scale regardless of rental-price magnitude.  Final OOF and
-        test predictions are inverted with np.expm1 before being returned so
-        all downstream code (metrics, submission) sees original-scale values.
-
-        Args:
-            oof_results: Mapping from algorithm name to the dict returned by
-                         ``_cross_validate_algorithm``; must contain the keys
-                         ``oof_predictions_log`` and ``test_predictions_log``.
-            y_log:       Log1p-transformed ground-truth target (train set).
-            y_orig:      Original-scale ground-truth target (train set).
-            seed:        Random seed forwarded to Ridge for reproducibility.
-
-        Returns:
-            oof_stacked  (np.ndarray): stacked OOF predictions, original scale.
-            test_stacked (np.ndarray): stacked test predictions, original scale.
-            meta         (Ridge):      fitted meta-learner (stored in state for
-                                       inspection / serialisation).
-        """
-        algos = list(oof_results.keys())
-        if len(algos) < 2:
-            self._log(
-                "Stacking requires >=2 algorithms; only %d available. "
-                "Falling back to inverse_mse ensemble.",
-                len(algos),
-                level="warning",
-            )
-            oof_ens, test_ens, _ = self._build_ensemble(
-                oof_results,
-                {a: oof_results[a]["test_predictions"] for a in algos},
-                y_orig,
-                method="inverse_mse",
-            )
-            return oof_ens, test_ens, None  # type: ignore[return-value]
-
-        # Build meta-feature matrices in log space
-        meta_train = np.column_stack(
-            [oof_results[a]["oof_predictions_log"] for a in algos]
-        )  # shape (n_train, n_algos)
-        meta_test = np.column_stack(
-            [oof_results[a]["test_predictions_log"] for a in algos]
-        )  # shape (n_test, n_algos)
-
-        # Fit Ridge in log space
-        meta = Ridge(alpha=1.0, random_state=seed, fit_intercept=True)
-        meta.fit(meta_train, y_log)
-        self._log(
-            f"Stacking Ridge coefficients: "
-            + ", ".join(f"{a}={c:.4f}" for a, c in zip(algos, meta.coef_))
-            + f", intercept={meta.intercept_:.4f}"
-        )
-
-        oof_stacked_log = meta.predict(meta_train)
-        test_stacked_log = meta.predict(meta_test)
-
-        oof_stacked = np.expm1(oof_stacked_log)
-        test_stacked = np.expm1(test_stacked_log)
-
-        stacking_mse = float(mean_squared_error(y_orig, oof_stacked))
-        self._log(f"Stacking OOF MSE={stacking_mse:.4f} (original price scale)")
-
-        return oof_stacked, test_stacked, meta
-
-    # ------------------------------------------------------------------
-    # Submission builder
+    # Submission builder (extracted for clarity and testability)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -592,7 +464,19 @@ Respond with JSON only.
         """
         Build a submission DataFrame with columns ``[index, prediction]``.
 
-        Predictions are in the original price scale (expm1 already applied).
+        The ``index`` column is a simple integer range from 0 to
+        ``len(test_ensemble) - 1``, matching the row order of the test set.
+        No deduplication or sorting is performed.
+
+        Parameters
+        ----------
+        test_ensemble:
+            Array of ensemble predictions for the test set.
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: ``index`` (0-based integer), ``prediction`` (float).
         """
         return pd.DataFrame(
             {
@@ -608,24 +492,18 @@ Respond with JSON only.
     def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """
         1. Ask LLM for model plan.
-        2. Apply log1p to the target (train in log space).
-        3. Tune each enabled algorithm with Optuna.
-        4. Train with K-fold CV using best params.
-        5. Invert predictions with expm1 (all OOF/test back to original scale).
-        6. Build ensemble (inverse_mse / equal) or stacking meta-learner.
-        7. Write submission.
+        2. Tune each enabled algorithm with Optuna.
+        3. Train with K-fold CV using best params.
+        4. Build ensemble.
+        5. Populate state with submission_df (saving to disk is main.py's responsibility).
         """
         X: np.ndarray = state["train_feat"].values.astype(np.float32)
-        y_orig: np.ndarray = state["target_series"].values.astype(np.float32)
+        y: np.ndarray = state["target_series"].values.astype(np.float32)
         X_test: np.ndarray = state["test_feat"].values.astype(np.float32)
         test_ids: pd.Series = state["test_ids"]
         feature_names: List[str] = state["feature_names"]
 
-        # --- Log-transform the target ---
-        y_log: np.ndarray = np.log1p(y_orig.clip(min=0)).astype(np.float32)
-        self._log(f"Target log1p applied. y_orig range: [{y_orig.min():.2f}, {y_orig.max():.2f}] "
-                  f"y_log range: [{y_log.min():.4f}, {y_log.max():.4f}]")
-
+        # Log GPU status once at the start (uses cached check from ModelTools)
         _logger.info("[GPU] GPU available: %s", gpu_available())
 
         # --- LLM plan ---
@@ -636,14 +514,8 @@ Respond with JSON only.
         ensemble_method: str = plan.get("ensemble_method", "inverse_mse")
         seed: int = int(plan.get("random_seed", 42))
 
-        # Also activate stacking when improvement hints mention it
-        model_hints = state.get("improvement_plan", {}).get("model_hints", "")
-        if "stack" in model_hints.lower():
-            ensemble_method = "stacking"
-            self._log("Stacking activated via improvement_plan model_hints.")
-
         enabled_algos = [a for a, c in models_cfg.items() if c.get("enabled", False)]
-        self._log(f"Training algorithms: {enabled_algos}, cv_folds={n_splits}, ensemble={ensemble_method}")
+        self._log(f"Training algorithms: {enabled_algos}, cv_folds={n_splits}")
 
         oof_results: Dict[str, Dict[str, Any]] = {}
         test_predictions: Dict[str, np.ndarray] = {}
@@ -653,7 +525,7 @@ Respond with JSON only.
             self._log(f"Tuning {algo} with Optuna ({algo_cfg.get('n_trials', 20)} trials)\u2026")
 
             try:
-                best_params = self._tune_algorithm(algo, algo_cfg, X, y_log, seed)
+                best_params = self._tune_algorithm(algo, algo_cfg, X, y, seed)
             except Exception as exc:
                 self._log(f"Optuna tuning failed for {algo}: {exc}. Using fixed params.", level="warning")
                 best_params = {}
@@ -661,7 +533,7 @@ Respond with JSON only.
             self._log(f"CV training {algo}\u2026")
             try:
                 result = self._cross_validate_algorithm(
-                    algo, algo_cfg, best_params, X, y_log, y_orig, X_test, n_splits, seed, feature_names
+                    algo, algo_cfg, best_params, X, y, X_test, n_splits, seed, feature_names
                 )
                 oof_results[algo] = result
                 test_predictions[algo] = result["test_predictions"]
@@ -677,22 +549,14 @@ Respond with JSON only.
         if not oof_results:
             raise RuntimeError("No models trained successfully.")
 
-        # --- Ensemble or Stacking ---
-        stacking_meta: Optional[Ridge] = None
-        if ensemble_method == "stacking":
-            oof_ensemble, test_ensemble, stacking_meta = self._build_stacking_ensemble(
-                oof_results, y_log, y_orig, seed=seed
-            )
-            ensemble_weights: Dict[str, float] = {"stacking": 1.0}
-        else:
-            oof_ensemble, test_ensemble, ensemble_weights = self._build_ensemble(
-                oof_results, test_predictions, y_orig, method=ensemble_method
-            )
+        # --- Ensemble ---
+        oof_ensemble, test_ensemble, ensemble_weights = self._build_ensemble(
+            oof_results, test_predictions, y, method=ensemble_method
+        )
+        ensemble_mse = float(mean_squared_error(y, oof_ensemble))
+        self._log(f"Ensemble OOF MSE={ensemble_mse:.4f}")
 
-        ensemble_mse = float(mean_squared_error(y_orig, oof_ensemble))
-        self._log(f"Final OOF MSE={ensemble_mse:.4f} (original price scale, method={ensemble_method})")
-
-        # --- Submission ---
+        # --- Submission --- (saving to disk is owned by main.py)
         submission = self._build_submission(test_ensemble)
 
         # --- Store in state ---
@@ -709,6 +573,5 @@ Respond with JSON only.
         state["ensemble_test"] = test_ensemble
         state["submission_df"] = submission
         state["ensemble_cv_mse"] = ensemble_mse
-        state["stacking_meta"] = stacking_meta
 
         return state

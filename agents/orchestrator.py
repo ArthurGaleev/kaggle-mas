@@ -6,12 +6,6 @@ ACCEPT the current results or IMPROVE with specific targeted actions. It
 then routes the pipeline back to the appropriate agent with an improvement
 plan injected into state, and enforces a hard iteration cap to prevent
 infinite loops.
-
-Threshold behaviour:
-  The target MSE threshold is read from ``cfg.pipeline.target_mse_threshold``
-  (default 1500.0, defined in configs/config.yaml).  When the ensemble OOF
-  MSE is already at or below this value the orchestrator ACCEPT-rules are
-  calibrated accordingly and the LLM is explicitly told the target is met.
 """
 
 import json
@@ -68,16 +62,6 @@ class OrchestratorAgent(BaseAgent):
     )
 
     # ------------------------------------------------------------------
-    # Config helpers
-    # ------------------------------------------------------------------
-
-    def _target_mse_threshold(self) -> float:
-        """Return the target MSE threshold from config (pipeline.target_mse_threshold)."""
-        return float(
-            OmegaConf.select(self.cfg, "pipeline.target_mse_threshold", default=1500.0)
-        )
-
-    # ------------------------------------------------------------------
     # LLM decision request
     # ------------------------------------------------------------------
 
@@ -90,7 +74,6 @@ class OrchestratorAgent(BaseAgent):
         interpretation = state.get("llm_interpretation", "")
         iteration = state.get("iteration", 0)
         max_iter = int(OmegaConf.select(self.cfg, "max_iterations", default=3))
-        threshold = self._target_mse_threshold()
         history_summary = self._format_history(state.get("decision_history", []))
 
         ens = report.get("ensemble", {}).get("oof_metrics", {})
@@ -98,23 +81,13 @@ class OrchestratorAgent(BaseAgent):
         best_algo = min(per_algo, key=lambda a: per_algo[a]["oof_metrics"]["mse"], default="N/A")
         best_mse = per_algo.get(best_algo, {}).get("oof_metrics", {}).get("mse", "N/A")
 
-        current_mse = ens.get("mse", float("inf"))
-        threshold_met = isinstance(current_mse, (int, float)) and current_mse <= threshold
-        threshold_status = (
-            f"TARGET MET (MSE={current_mse:.2f} <= threshold={threshold:.2f})"
-            if threshold_met
-            else f"target not yet met (MSE={current_mse} vs threshold={threshold:.2f})"
-        )
-
         prompt = f"""
 ## Iteration {iteration + 1} / {max_iter}
 
 ### Current ensemble OOF metrics
-MSE={ens.get('mse', 'N/A')}, RMSE={ens.get('rmse', 'N/A')}, R\u00b2={ens.get('r2', 'N/A')}
+MSE={ens.get('mse', 'N/A')}, RMSE={ens.get('rmse', 'N/A')}, R²={ens.get('r2', 'N/A')}
 
 ### Best single algorithm: {best_algo} (MSE={best_mse})
-
-### Competition threshold: {threshold:.2f}  —  {threshold_status}
 
 ### EvaluatorAgent interpretation
 {interpretation}
@@ -126,12 +99,10 @@ MSE={ens.get('mse', 'N/A')}, RMSE={ens.get('rmse', 'N/A')}, R\u00b2={ens.get('r2
 Decide whether to ACCEPT the current results or to IMPROVE the pipeline.
 
 Rules:
-- ACCEPT if: (a) MSE improvement from the last iteration was < 2%  OR
-                 ensemble MSE is already <= competition threshold ({threshold:.2f}), OR
+- ACCEPT if: (a) MSE improvement from the last iteration was < 2%, OR
               (b) this is the last allowed iteration ({max_iter}), OR
-              (c) results are already strong (e.g. R\u00b2 > 0.90).
+              (c) results are already strong (e.g. R² > 0.90).
 - IMPROVE only if there is a specific, achievable change with realistic impact.
-  When suggesting stacking, set model_hints to include the word 'stacking'.
 
 If IMPROVE, specify which agent to re-run and exactly what to change.
 
@@ -205,7 +176,7 @@ Respond with JSON only.
                 "models", "oof_predictions", "cv_scores", "feature_importances",
                 "ensemble_weights", "ensemble_oof", "test_predictions",
                 "ensemble_test", "submission_df", "ensemble_cv_mse", "model_plan",
-                "evaluation_report", "llm_interpretation", "stacking_meta",
+                "evaluation_report", "llm_interpretation",
             ],
             "feature_agent": [
                 "train_feat", "test_feat", "feature_names", "feature_plan",
@@ -213,13 +184,13 @@ Respond with JSON only.
                 "models", "oof_predictions", "cv_scores", "feature_importances",
                 "ensemble_weights", "ensemble_oof", "test_predictions",
                 "ensemble_test", "submission_df", "ensemble_cv_mse", "model_plan",
-                "evaluation_report", "llm_interpretation", "stacking_meta",
+                "evaluation_report", "llm_interpretation",
             ],
             "model_agent": [
                 "models", "oof_predictions", "cv_scores", "feature_importances",
                 "ensemble_weights", "ensemble_oof", "test_predictions",
                 "ensemble_test", "submission_df", "ensemble_cv_mse", "model_plan",
-                "evaluation_report", "llm_interpretation", "stacking_meta",
+                "evaluation_report", "llm_interpretation",
             ],
         }
         for key in keys_to_clear.get(next_agent, []):
@@ -254,6 +225,7 @@ Respond with JSON only.
         Returns:
             Final state after pipeline completion.
         """
+        # Import here to avoid circular imports at module load time
         from agents.data_agent import DataAgent
         from agents.feature_agent import FeatureAgent
         from agents.model_agent import ModelAgent
@@ -265,19 +237,22 @@ Respond with JSON only.
         state.setdefault("decision_history", [])
         state.setdefault("pipeline_complete", False)
 
+        # Instantiate sub-agents
         data_agent = DataAgent(self.cfg, self.llm_client, self.logger)
         feature_agent = FeatureAgent(self.cfg, self.llm_client, self.logger)
         model_agent = ModelAgent(self.cfg, self.llm_client, self.logger)
         evaluator_agent = EvaluatorAgent(self.cfg, self.llm_client, self.logger)
 
+        # --- Initial pipeline run ---
         self._log("Starting initial pipeline run\u2026")
         state = data_agent._timed_execute(state)
         state = feature_agent._timed_execute(state)
         state = model_agent._timed_execute(state)
         state = evaluator_agent._timed_execute(state)
 
+        # --- Feedback loop ---
         while state["iteration"] < max_iter:
-            state = self._timed_execute(state)
+            state = self._timed_execute(state)  # orchestrator decides
 
             if state.get("pipeline_complete"):
                 self._log("Pipeline complete — exiting feedback loop.")
@@ -292,7 +267,7 @@ Respond with JSON only.
             elif next_agent == "feature_agent":
                 state = feature_agent._timed_execute(state)
             elif next_agent == "model_agent":
-                pass
+                pass  # model_agent re-runs below
             else:
                 self._log(f"Unknown next_agent '{next_agent}'; stopping.", level="warning")
                 break
@@ -321,7 +296,6 @@ Respond with JSON only.
         """
         iteration = state.get("iteration", 0)
         max_iter = int(OmegaConf.select(self.cfg, "max_iterations", default=3))
-        threshold = self._target_mse_threshold()
 
         # Hard limit check
         if iteration >= max_iter:
@@ -331,38 +305,6 @@ Respond with JSON only.
             state["reasoning"] = f"Hard limit of {max_iter} iterations reached."
             state["next_agent"] = None
             state["improvement_plan"] = {}
-            return state
-
-        # Early-exit if threshold already met (no LLM call needed)
-        current_mse = (
-            state.get("evaluation_report", {})
-                 .get("ensemble", {})
-                 .get("oof_metrics", {})
-                 .get("mse", float("inf"))
-        )
-        if isinstance(current_mse, (int, float)) and current_mse <= threshold:
-            self._log(
-                f"MSE={current_mse:.2f} already meets threshold={threshold:.2f}. "
-                "Auto-ACCEPT without LLM call."
-            )
-            state["decision"] = _ACCEPT
-            state["pipeline_complete"] = True
-            state["reasoning"] = (
-                f"MSE={current_mse:.2f} <= target threshold={threshold:.2f}. "
-                "Auto-accepted."
-            )
-            state["next_agent"] = None
-            state["improvement_plan"] = {}
-            state["iteration"] = iteration + 1
-            history: List[Dict[str, Any]] = state.get("decision_history", [])
-            history.append({
-                "iteration": iteration,
-                "decision": _ACCEPT,
-                "reasoning": state["reasoning"],
-                "next_agent": None,
-                "ensemble_mse": current_mse,
-            })
-            state["decision_history"] = history
             return state
 
         # --- Ask LLM ---
@@ -389,9 +331,12 @@ Respond with JSON only.
             "decision": decision,
             "reasoning": reasoning,
             "next_agent": next_agent if decision == _IMPROVE else None,
-            "ensemble_mse": current_mse,
+            "ensemble_mse": state.get("evaluation_report", {})
+                                  .get("ensemble", {})
+                                  .get("oof_metrics", {})
+                                  .get("mse"),
         }
-        history = state.get("decision_history", [])
+        history: List[Dict[str, Any]] = state.get("decision_history", [])
         history.append(history_entry)
 
         # Update state
