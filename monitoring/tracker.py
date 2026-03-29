@@ -71,6 +71,11 @@ class PipelineTracker:
         self._llm_completion_tokens: int = 0
         self._llm_total_latency: float = 0.0
 
+        # Caches populated only when loading from a saved report.
+        # None means "not loaded from file — derive from events as usual".
+        self._cached_model_metrics: Optional[Dict[str, Dict[str, List[float]]]] = None
+        self._cached_feedback_history: Optional[List[Dict[str, Any]]] = None
+
         logger.info("PipelineTracker initialised at %s", self._start_wall)
 
     # ------------------------------------------------------------------
@@ -84,6 +89,13 @@ class PipelineTracker:
         Reconstructs the tracker object from the JSON file produced by
         :meth:`save_report`, restoring all events and aggregate LLM counters
         so that :meth:`get_summary` works correctly on the reloaded instance.
+
+        Top-level ``model_metrics`` and ``feedback_history`` keys saved by
+        :meth:`save_report` are cached on the instance and used as a fallback
+        by :meth:`get_summary` when the ``events`` list does not contain the
+        corresponding raw event entries.  This ensures that
+        ``feedback_loop_progress.png`` and ``model_comparison.png`` are always
+        populated when those fields were present in the original report.
 
         Parameters
         ----------
@@ -128,6 +140,19 @@ class PipelineTracker:
                 tracker._llm_prompt_tokens += evt.get("prompt_tokens", 0)
                 tracker._llm_completion_tokens += evt.get("completion_tokens", 0)
                 tracker._llm_total_latency += evt.get("latency_s", 0.0)
+
+        # Cache top-level aggregates from the saved report so that
+        # get_summary() can fall back to them when the events list does not
+        # contain the raw metric / feedback events (e.g. summary-only reports).
+        saved_model_metrics = report.get("model_metrics")
+        tracker._cached_model_metrics = (
+            saved_model_metrics if isinstance(saved_model_metrics, dict) else None
+        )
+
+        saved_feedback_history = report.get("feedback_history")
+        tracker._cached_feedback_history = (
+            saved_feedback_history if isinstance(saved_feedback_history, list) else None
+        )
 
         logger.info(
             "PipelineTracker loaded from %s (%d events)", out_path, len(tracker.events)
@@ -416,6 +441,16 @@ class PipelineTracker:
         dict
             Includes wall times, phase durations, LLM aggregate stats, model
             metrics keyed by model name, and the raw event list.
+
+        Notes
+        -----
+        When the tracker was created via :meth:`load`, ``model_metrics`` and
+        ``feedback_history`` are first rebuilt by scanning ``self.events``.
+        If that scan yields empty results (because the saved report did not
+        include raw metric/feedback events), the method falls back to the
+        top-level values cached from the JSON file during :meth:`load`.  This
+        prevents ``model_comparison.png`` and ``feedback_loop_progress.png``
+        from rendering as empty "no data" placeholders after a reload.
         """
         total_elapsed = _elapsed(self._start_ts)
 
@@ -435,12 +470,20 @@ class PipelineTracker:
                 k = f"{evt['split']}/{evt['metric']}"
                 model_metrics.setdefault(m, {}).setdefault(k, []).append(evt["value"])
 
+        # Fall back to the cached top-level dict when events yield nothing
+        if not model_metrics and self._cached_model_metrics:
+            model_metrics = self._cached_model_metrics
+
         # Feedback loop history
         feedback_history = [
             {"iteration": e["iteration"], "best_mse": e["best_mse"]}
             for e in self.events
             if e["type"] == EVT_FEEDBACK_ITER
         ]
+
+        # Fall back to the cached top-level list when events yield nothing
+        if not feedback_history and self._cached_feedback_history:
+            feedback_history = self._cached_feedback_history
 
         return {
             "run_start": self._start_wall,
