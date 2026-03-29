@@ -599,8 +599,39 @@ Respond with JSON only.
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
         """
         Combine per-algorithm OOF and test predictions into a weighted ensemble.
+
+        First attempts stacking via RidgeCV meta-learner. Falls back to
+        inverse-MSE weighted average if stacking fails.
         """
         algos = list(oof_results.keys())
+
+        # --- Try stacking meta-learner first ---
+        if len(algos) >= 2:
+            try:
+                from sklearn.linear_model import RidgeCV
+
+                oof_matrix = np.column_stack(
+                    [oof_results[a]["oof_predictions"] for a in algos]
+                )
+                test_matrix = np.column_stack(
+                    [test_results[a] for a in algos]
+                )
+
+                meta = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0])
+                meta.fit(oof_matrix, y)
+                oof_ensemble = meta.predict(oof_matrix)
+                test_ensemble = meta.predict(test_matrix)
+
+                # Report meta-learner coefficients as weights
+                weight_dict = dict(zip(algos, meta.coef_.tolist()))
+                self._log(f"Stacking meta-learner (RidgeCV) weights: {weight_dict}, "
+                          f"alpha={meta.alpha_}")
+                return oof_ensemble, test_ensemble, weight_dict
+            except Exception as exc:
+                self._log(f"Stacking failed, falling back to weighted average: {exc}",
+                          level="warning")
+
+        # --- Fallback: inverse-MSE weighted average ---
         mses = np.array([oof_results[a]["mean_cv_mse"] for a in algos])
 
         if method == "inverse_mse":
@@ -610,7 +641,7 @@ Respond with JSON only.
 
         weights = raw_weights / raw_weights.sum()
         weight_dict = dict(zip(algos, weights.tolist()))
-        self._log(f"Ensemble weights: {weight_dict}")
+        self._log(f"Ensemble weights (weighted avg): {weight_dict}")
 
         oof_ensemble = sum(
             weights[i] * oof_results[algos[i]]["oof_predictions"]
