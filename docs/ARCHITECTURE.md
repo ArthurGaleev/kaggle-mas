@@ -28,11 +28,11 @@ Five specialized agents are wired together using [LangGraph](https://github.com/
 │    │                                                                   │
 │    ▼                                                                   │
 │  ┌──────────────────┐                                                  │
-│  │  [RAG: DataCtx]  │  ← retrieves Kaggle rental data best practices  │
+│  │  [RAG: DataCtx]  │  ← retrieves Kaggle rental data best practices   │
 │  └────────┬─────────┘                                                  │
 │           ▼                                                            │
 │  ┌──────────────────┐                                                  │
-│  │   DataAgent      │  profile → LLM cleaning plan → execute          │
+│  │   DataAgent      │  profile → LLM cleaning plan → execute           │
 │  └────────┬─────────┘                                                  │
 │           ▼                                                            │
 │  ┌──────────────────┐                                                  │
@@ -40,11 +40,11 @@ Five specialized agents are wired together using [LangGraph](https://github.com/
 │  └────────┬─────────┘                                                  │
 │           ▼                                                            │
 │  ┌──────────────────┐                                                  │
-│  │ [RAG: FeatCtx]   │  ← retrieves feature engineering papers         │
+│  │ [RAG: FeatCtx]   │  ← retrieves feature engineering papers          │
 │  └────────┬─────────┘                                                  │
 │           ▼                                                            │
 │  ┌──────────────────┐                                                  │
-│  │  FeatureAgent    │  LLM feature plan → execute (datetime/geo/text) │
+│  │  FeatureAgent    │  LLM feature plan → execute (datetime/geo/text)  │
 │  └────────┬─────────┘                                                  │
 │           ▼                                                            │
 │  ┌──────────────────┐                                                  │
@@ -52,19 +52,19 @@ Five specialized agents are wired together using [LangGraph](https://github.com/
 │  └────────┬─────────┘                                                  │
 │           ▼                                                            │
 │  ┌──────────────────┐                                                  │
-│  │ [RAG: ModelCtx]  │  ← retrieves GBDT tuning recipes                │
+│  │ [RAG: ModelCtx]  │  ← retrieves GBDT tuning recipes                 │
 │  └────────┬─────────┘                                                  │
 │           ▼                                                            │
 │  ┌──────────────────┐                                                  │
-│  │   ModelAgent     │  LightGBM + XGBoost + CatBoost + Optuna         │
+│  │   ModelAgent     │  LightGBM + XGBoost + CatBoost + Optuna          │
 │  └────────┬─────────┘                                                  │
 │           ▼                                                            │
 │  ┌──────────────────┐                                                  │
-│  │ [RAG: EvalCtx]   │  ← retrieves Kaggle evaluation guidance         │
+│  │ [RAG: EvalCtx]   │  ← retrieves Kaggle evaluation guidance          │
 │  └────────┬─────────┘                                                  │
 │           ▼                                                            │
 │  ┌──────────────────┐                                                  │
-│  │  EvaluatorAgent  │  OOF MSE + RMSE + MAE; LLM interpretation       │
+│  │  EvaluatorAgent  │  OOF MSE + RMSE + MAE; LLM interpretation        │
 │  └────────┬─────────┘                                                  │
 │           ▼                                                            │
 │  ┌──────────────────┐                                                  │
@@ -72,14 +72,14 @@ Five specialized agents are wired together using [LangGraph](https://github.com/
 │  └────────┬─────────┘                                                  │
 │           ▼                                                            │
 │  ┌──────────────────┐                                                  │
-│  │ [RAG: OrchCtx]   │  ← retrieves decision best practices            │
+│  │ [RAG: OrchCtx]   │  ← retrieves decision best practices             │
 │  └────────┬─────────┘                                                  │
 │           ▼                                                            │
 │  ┌──────────────────┐                                                  │
-│  │ OrchestratorAgent│ ←─────────────────────────────────────────────┐ │
-│  └────────┬─────────┘                                               │ │
-│   ACCEPT  │    IMPROVE                                              │ │
-│           │       └── next_agent = feature|model|data_agent ──────┘ │
+│  │ OrchestratorAgent│ ←─────────────────────────────────────────────┐  │
+│  └────────┬─────────┘                                               │  │
+│   ACCEPT  │    IMPROVE                                              │  │
+│           │       └── next_agent = feature|model|data_agent ────────┘  │
 │           ▼                                                            │
 │         END                                                            │
 └────────────────────────────────────────────────────────────────────────┘
