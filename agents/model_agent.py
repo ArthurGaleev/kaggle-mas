@@ -9,7 +9,9 @@ type. All training and tuning code is deterministic Python.
 
 import gc
 import json
+import logging
 import os
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +26,82 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 from agents.base import BaseAgent
 from utils.helpers import safe_json_parse
+
+_logger = logging.getLogger("kaggle-mas.model_agent")
+
+
+# ---------------------------------------------------------------------------
+# GPU detection helpers
+# ---------------------------------------------------------------------------
+
+def _gpu_available() -> bool:
+    """Return True if a CUDA GPU is accessible."""
+    # Fast path: use torch if it is already imported
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        pass
+    # Fallback: probe nvidia-smi (works in Colab/Kaggle without torch)
+    try:
+        subprocess.run(
+            ["nvidia-smi"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=5,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _gpu_params(algo: str) -> Dict[str, Any]:
+    """
+    Return the library-specific params required to run *algo* on the GPU.
+
+    Falls back to CPU params silently so the pipeline still works on
+    machines without a CUDA GPU (e.g. local dev boxes).
+
+    Parameters
+    ----------
+    algo : str
+        One of ``"lightgbm"``, ``"xgboost"``, ``"catboost"``.
+
+    Returns
+    -------
+    dict
+        Params dict to be merged into the model's fixed params.
+    """
+    if not _gpu_available():
+        _logger.info("[GPU] No CUDA GPU detected — running %s on CPU.", algo)
+        if algo == "xgboost":
+            return {"tree_method": "hist"}
+        if algo == "catboost":
+            return {"task_type": "CPU"}
+        return {}  # LightGBM defaults to CPU without device param
+
+    _logger.info("[GPU] CUDA GPU detected — configuring %s for GPU.", algo)
+
+    if algo == "lightgbm":
+        return {"device": "gpu"}
+
+    if algo == "xgboost":
+        # XGBoost ≥2.0 uses `device='cuda'`; older versions use `tree_method='gpu_hist'`.
+        try:
+            import xgboost as xgb
+            major = int(xgb.__version__.split(".")[0])
+            if major >= 2:
+                return {"device": "cuda"}
+            else:
+                return {"tree_method": "gpu_hist"}
+        except Exception:
+            return {"device": "cuda"}
+
+    if algo == "catboost":
+        return {"task_type": "GPU"}
+
+    return {}
 
 
 class ModelAgent(BaseAgent):
@@ -42,7 +120,7 @@ class ModelAgent(BaseAgent):
     State keys produced:
         models          (dict):          trained model objects per fold per algorithm.
         oof_predictions (dict):          out-of-fold predictions per algorithm.
-        cv_scores       (dict):          per-fold MSE scores per algorithm.
+        cv_scores       (dict):          per-fold metrics by model name.
         feature_importances (dict):      mean feature importance per algorithm.
         ensemble_weights (dict):         weights used for ensemble.
         ensemble_oof    (np.ndarray):    ensemble OOF predictions.
@@ -80,13 +158,14 @@ price regression task (Kaggle, MSE metric).
 {improvement_hints or "None — this is the first training run."}
 
 ## Available models
-- lightgbm:  fast, memory-efficient, good default choice
-- xgboost:   solid alternative; use tree_method='hist' for speed
-- catboost:  strong with categoricals; slower but accurate
+- lightgbm:  fast, GPU-accelerated (device='gpu'), memory-efficient
+- xgboost:   GPU-accelerated via device='cuda' (XGBoost >=2.0) or tree_method='gpu_hist' (older)
+- catboost:  strong with categoricals; GPU via task_type='GPU'
 
 ## Instructions
 Decide which models to enable, how many Optuna trials to run (≤ 30 for notebook
 constraints), and what param ranges to search.  Keep it practical.
+Always include the GPU acceleration parameter for each enabled model.
 
 Return strict JSON only:
 {{
@@ -96,6 +175,7 @@ Return strict JSON only:
       "n_trials": 20,
       "fixed_params": {{
         "verbosity": -1,
+        "device": "gpu",
         "n_estimators": 1000,
         "early_stopping_rounds": 50
       }},
@@ -113,7 +193,7 @@ Return strict JSON only:
       "enabled": true,
       "n_trials": 15,
       "fixed_params": {{
-        "tree_method": "hist",
+        "device": "cuda",
         "n_estimators": 1000,
         "early_stopping_rounds": 50,
         "verbosity": 0
@@ -133,6 +213,7 @@ Return strict JSON only:
       "fixed_params": {{
         "iterations": 1000,
         "early_stopping_rounds": 50,
+        "task_type": "GPU",
         "verbose": 0
       }},
       "search_space": {{
@@ -153,7 +234,12 @@ Respond with JSON only.
                 "lightgbm": {
                     "enabled": True,
                     "n_trials": 20,
-                    "fixed_params": {"verbosity": -1, "n_estimators": 1000, "early_stopping_rounds": 50},
+                    "fixed_params": {
+                        "verbosity": -1,
+                        "device": "gpu",
+                        "n_estimators": 1000,
+                        "early_stopping_rounds": 50,
+                    },
                     "search_space": {
                         "num_leaves":        {"type": "int",   "low": 31,   "high": 255},
                         "learning_rate":     {"type": "float", "low": 0.01, "high": 0.3,  "log": True},
@@ -166,8 +252,12 @@ Respond with JSON only.
                 "xgboost": {
                     "enabled": True,
                     "n_trials": 15,
-                    "fixed_params": {"tree_method": "hist", "n_estimators": 1000,
-                                     "early_stopping_rounds": 50, "verbosity": 0},
+                    "fixed_params": {
+                        "device": "cuda",
+                        "n_estimators": 1000,
+                        "early_stopping_rounds": 50,
+                        "verbosity": 0,
+                    },
                     "search_space": {
                         "max_depth":        {"type": "int",   "low": 3,    "high": 12},
                         "learning_rate":    {"type": "float", "low": 0.01, "high": 0.3,  "log": True},
@@ -220,7 +310,9 @@ Respond with JSON only.
     ) -> Tuple[Any, float]:
         import lightgbm as lgb
 
-        merged = {**fixed, **params}
+        # Merge GPU params; allow explicit override from plan (e.g. device='cpu')
+        gpu = _gpu_params("lightgbm")
+        merged = {**gpu, **fixed, **params}
         n_est = merged.pop("n_estimators", 1000)
         es = merged.pop("early_stopping_rounds", 50)
 
@@ -254,7 +346,12 @@ Respond with JSON only.
     ) -> Tuple[Any, float]:
         import xgboost as xgb
 
-        merged = {**fixed, **params}
+        # Merge GPU params first so explicit plan values can override
+        gpu = _gpu_params("xgboost")
+        # Remove any conflicting CPU key from fixed before merging
+        fixed_clean = {k: v for k, v in fixed.items()
+                       if k not in ("tree_method", "device") or k in gpu}
+        merged = {**gpu, **fixed_clean, **params}
         n_est = merged.pop("n_estimators", 1000)
         es = merged.pop("early_stopping_rounds", 50)
 
@@ -280,7 +377,9 @@ Respond with JSON only.
     ) -> Tuple[Any, float]:
         from catboost import CatBoostRegressor, Pool
 
-        merged = {**fixed, **params}
+        # Merge GPU params; allow explicit plan override
+        gpu = _gpu_params("catboost")
+        merged = {**gpu, **fixed, **params}
         model = CatBoostRegressor(**merged)
         model.fit(
             X_train, y_train,
@@ -468,6 +567,9 @@ Respond with JSON only.
         X_test: np.ndarray = state["test_feat"].values.astype(np.float32)
         test_ids: pd.Series = state["test_ids"]
         feature_names: List[str] = state["feature_names"]
+
+        # Log GPU status once at the start
+        _logger.info("[GPU] GPU available: %s", _gpu_available())
 
         # --- LLM plan ---
         plan = self._request_model_plan(state)
