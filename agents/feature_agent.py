@@ -463,6 +463,25 @@ Respond with JSON only.
         self._log(f"Feature plan enabled groups: "
                   f"{[g for g, cfg in groups.items() if cfg.get('enabled')]}")
 
+        # --- Prune low-importance features from prior iteration ---
+        prev_importances = state.get("feature_importances", {})
+        if prev_importances and state.get("iteration", 0) > 0:
+            combined = {}
+            weights = state.get("ensemble_weights", {})
+            for algo, imp in prev_importances.items():
+                w = weights.get(algo, 1.0 / len(prev_importances))
+                for feat, val in imp.items():
+                    combined[feat] = combined.get(feat, 0.0) + w * val
+            max_imp = max(combined.values()) if combined else 1.0
+            drop_feats = [f for f, v in combined.items() if v < 0.01 * max_imp]
+            if drop_feats:
+                self._log(f"Pruning {len(drop_feats)} low-importance features: "
+                          f"{drop_feats[:10]}...", level="warning")
+                train.drop(columns=[c for c in drop_feats if c in train.columns],
+                           inplace=True)
+                test.drop(columns=[c for c in drop_feats if c in test.columns],
+                          inplace=True)
+
         # --- Execute each feature group ---
         if groups.get("datetime_features", {}).get("enabled", True):
             train, test = self._add_datetime_features(train, test)
