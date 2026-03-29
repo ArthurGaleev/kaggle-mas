@@ -14,6 +14,18 @@ stores the request in the feature plan but defers execution to ModelAgent,
 which applies the encoding *inside* each KFold split using only the training
 fold.  Use `_compute_target_encoding_map` (exported below) for that purpose.
 
+NOTE ON FREQUENCY ENCODING
+---------------------------
+Frequency encoding is computed on the full training set here (before CV
+splits), which technically leaks test-fold category frequencies into the
+training folds.  The leakage is minor because frequency does not directly
+encode the target, but it is non-zero when category frequency correlates
+with price (e.g., popular hosts tend to charge more).  A fully leak-free
+alternative is to recompute the frequency map inside each CV fold in
+ModelAgent — the same pattern used for target encoding.  The current
+implementation is kept for simplicity and computational speed; replace with
+fold-level frequency encoding if you observe CV/LB gap on frequency features.
+
 NOTE ON SCALING
 ---------------
 StandardScaler is deliberately omitted from the pipeline.  Tree-based GBDT
@@ -21,6 +33,15 @@ models (LightGBM / XGBoost / CatBoost) are invariant to monotonic feature
 transformations, so scaling neither hurts nor helps them — but fitting a
 scaler on the full training set before CV splits leaks validation-fold
 statistics into training data, inflating OOF performance estimates.
+
+NOTE ON REFERENCE DATE
+-----------------------
+All datetime features that measure elapsed time (e.g. dt_days_since_review)
+are computed relative to REFERENCE_DATE, a module-level constant set to
+2026-01-01.  Using a fixed date guarantees that re-running the pipeline
+(or looping through multiple feedback iterations) always produces identical
+feature values, which is essential for reproducible CV scores and for
+isolating the effect of other changes between iterations.
 """
 
 import gc
@@ -40,6 +61,11 @@ from sklearn.preprocessing import LabelEncoder
 
 from agents.base import BaseAgent
 from utils.helpers import safe_json_parse
+
+# Fixed reference date for all elapsed-time features.
+# Must never be pd.Timestamp.now() — that makes features non-deterministic
+# across re-runs and across feedback loop iterations.
+REFERENCE_DATE: pd.Timestamp = pd.Timestamp("2026-01-01")
 
 
 def _compute_target_encoding_map(
@@ -210,9 +236,15 @@ Respond with JSON only.
     def _add_datetime_features(
         self, train: pd.DataFrame, test: pd.DataFrame
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Extract temporal signals from 'last_dt'."""
+        """Extract temporal signals from 'last_dt'.
+
+        All elapsed-time features are computed relative to the module-level
+        REFERENCE_DATE constant (2026-01-01) rather than pd.Timestamp.now().
+        This guarantees identical feature values across pipeline re-runs and
+        across feedback-loop iterations, which is essential for reproducible
+        CV scores.
+        """
         col = "last_dt"
-        reference_date = pd.Timestamp.now()
 
         for df in (train, test):
             if col not in df.columns:
@@ -223,7 +255,7 @@ Respond with JSON only.
             df["dt_day_of_week"] = dt.dt.dayofweek.fillna(0).astype(int)
             df["dt_is_weekend"] = (df["dt_day_of_week"] >= 5).astype(int)
             df["dt_quarter"] = dt.dt.quarter.fillna(0).astype(int)
-            df["dt_days_since_review"] = (reference_date - dt).dt.days.fillna(-1).astype(int)
+            df["dt_days_since_review"] = (REFERENCE_DATE - dt).dt.days.fillna(-1).astype(int)
             df.drop(columns=[col], inplace=True, errors="ignore")
 
         return train, test
@@ -317,7 +349,16 @@ Respond with JSON only.
         train: pd.DataFrame,
         test: pd.DataFrame,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Count/frequency encoding for high-cardinality categoricals."""
+        """Count/frequency encoding for high-cardinality categoricals.
+
+        NOTE ON LEAKAGE: frequency maps are computed on the full training set
+        (before CV splits).  This is a minor pre-CV leak — the test-fold rows
+        contribute their category counts to the map used during training.
+        The leakage is smaller than target encoding because frequencies do not
+        directly encode the target value, but it is non-zero when popular
+        categories correlate with price.  See module docstring for details on
+        a fully leak-free alternative.
+        """
         # Operate on a snapshot of column names so we don't miss cols that
         # other encoding steps may have already dropped.
         cat_cols = [c for c in self.TARGET_ENCODE_COLS if c in train.columns]
@@ -382,147 +423,11 @@ Respond with JSON only.
                 continue
             le = LabelEncoder()
             combined = pd.concat(
-                [train[col].astype(str), test[col].astype(str)], ignore_index=True
+                [train[col].astype(str), test[col].astype(str)],
+                ignore_index=True,
             )
             le.fit(combined)
             train[f"le_{col}"] = le.transform(train[col].astype(str))
             test[f"le_{col}"] = le.transform(test[col].astype(str))
 
         return train, test
-
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
-
-    def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Ask the LLM for a feature plan, execute it, validate, and store results.
-
-        Target encoding is deliberately skipped here and deferred to ModelAgent
-        so it can be applied inside each CV fold without leakage.  The feature
-        plan is stored in state so ModelAgent knows which columns to encode and
-        what smoothing factor to use.
-        """
-        # --- Pull DataFrames from state ---
-        train: pd.DataFrame = state["train_df"].copy()
-        test: pd.DataFrame = state["test_df"].copy()
-
-        # Separate target and IDs before feature engineering
-        target = train.pop(self.TARGET_COL)
-        test_ids = test[self.ID_COL].copy()
-
-        # Drop ID from features (not predictive)
-        train.drop(columns=[self.ID_COL], inplace=True, errors="ignore")
-        test.drop(columns=[self.ID_COL], inplace=True, errors="ignore")
-
-        # --- Get LLM plan ---
-        plan = self._request_feature_plan(state)
-        state["feature_plan"] = plan
-        groups = plan.get("groups", {})
-        self._log(f"Feature plan enabled groups: {[g for g, cfg in groups.items() if cfg.get('enabled')]}")
-
-        # --- Execute each feature group ---
-
-        # Frequency encoding MUST run before any group that drops the raw
-        # categorical columns, so we get freq features from the originals.
-        if groups.get("frequency_encoding", {}).get("enabled", True):
-            train, test = self._add_frequency_encoding(train, test)
-
-        if groups.get("datetime_features", {}).get("enabled", True):
-            train, test = self._add_datetime_features(train, test)
-
-        if groups.get("geo_features", {}).get("enabled", True):
-            n_clusters = groups["geo_features"].get("n_clusters", 8)
-            train, test = self._add_geo_features(train, test, n_clusters=n_clusters)
-
-        if groups.get("text_features", {}).get("enabled", True):
-            n_comp = groups.get("text_features", {}).get("n_components", 5)
-            max_feat = groups.get("text_features", {}).get("max_features", 300)
-            train, test = self._add_text_features(train, test, n_components=n_comp, max_features=max_feat)
-
-        # target_encoding is intentionally skipped here — ModelAgent applies
-        # it inside each CV fold via _compute_target_encoding_map to prevent
-        # label leakage.  The raw categorical columns are kept in train/test
-        # for that purpose and dropped by ModelAgent after fold-level encoding.
-
-        if groups.get("interaction_features", {}).get("enabled", True):
-            pairs = groups.get("interaction_features", {}).get("pairs")
-            train, test = self._add_interaction_features(train, test, pairs=pairs)
-
-        if groups.get("log_transforms", {}).get("enabled", True):
-            log_cols = groups.get("log_transforms", {}).get("columns")
-            train, test = self._add_log_transforms(train, test, columns=log_cols)
-
-        if groups.get("label_encoding", {}).get("enabled", True):
-            le_cols = groups.get("label_encoding", {}).get("columns")
-            train, test = self._add_label_encoding(train, test, columns=le_cols)
-
-        # --- Drop any remaining object columns (not encoded yet) ---
-        # Keep TARGET_ENCODE_COLS if target_encoding is requested — ModelAgent
-        # needs them to compute per-fold maps.
-        te_enabled = groups.get("target_encoding", {}).get("enabled", True)
-        keep_for_te = set(self.TARGET_ENCODE_COLS) if te_enabled else set()
-
-        obj_cols_train = [
-            c for c in train.select_dtypes(include="object").columns
-            if c not in keep_for_te
-        ]
-        obj_cols_test = [
-            c for c in test.select_dtypes(include="object").columns
-            if c not in keep_for_te
-        ]
-        drop_obj = list(set(obj_cols_train + obj_cols_test))
-        if drop_obj:
-            self._log(f"Dropping remaining object columns: {drop_obj}", level="warning")
-            train.drop(columns=[c for c in drop_obj if c in train.columns], inplace=True)
-            test.drop(columns=[c for c in drop_obj if c in test.columns], inplace=True)
-
-        # Also drop datetime-type columns if any remain
-        dt_cols = train.select_dtypes(include=["datetime64"]).columns.tolist()
-        if dt_cols:
-            train.drop(columns=dt_cols, inplace=True, errors="ignore")
-            test.drop(columns=[c for c in dt_cols if c in test.columns], inplace=True, errors="ignore")
-
-        # --- Align train/test columns ---
-        # Columns reserved for target encoding are excluded from the common-col
-        # check; they exist in both frames and will be handled by ModelAgent.
-        align_cols = [c for c in train.columns if c in test.columns]
-        train_only = [c for c in train.columns if c not in test.columns and c not in keep_for_te]
-        if train_only:
-            self._log(f"Columns in train but not test (dropping): {train_only}", level="warning")
-        train = train[align_cols]
-        test = test[align_cols]
-
-        # --- Validate guardrail ---
-        non_te_cols = [c for c in train.columns if c not in keep_for_te]
-        if len(non_te_cols) > self.MAX_FEATURES:
-            self._log(
-                f"Feature count {len(non_te_cols)} exceeds guardrail {self.MAX_FEATURES}. "
-                "Truncating to top columns by variance.",
-                level="warning",
-            )
-            variances = train[non_te_cols].var().sort_values(ascending=False)
-            keep_cols = variances.index[: self.MAX_FEATURES].tolist() + list(keep_for_te)
-            keep_cols = [c for c in train.columns if c in set(keep_cols)]  # preserve order
-            train = train[keep_cols]
-            test = test[keep_cols]
-
-        # Scaling intentionally omitted — see module docstring.
-
-        feature_names: List[str] = [
-            c for c in train.columns if c not in keep_for_te
-        ]
-        self._log(
-            f"Final feature count: {len(feature_names)}"
-            + (f" + {len(keep_for_te)} TE placeholder cols" if keep_for_te else "")
-        )
-
-        # --- Store in state ---
-        state["train_feat"] = train
-        state["test_feat"] = test
-        state["target_series"] = target
-        state["test_ids"] = test_ids
-        state["feature_names"] = feature_names
-
-        gc.collect()
-        return state

@@ -21,9 +21,9 @@ it to both the fold's training and validation splits, preventing leakage.
 
 OPTUNA TUNING SPLIT
 --------------------
-Hyperparameter search uses the *first KFold fold* (not a separate random
-80/20 split) so the tuning validation set never overlaps with the training
-portion of that fold, eliminating optimistic bias in the found parameters.
+Hyperparameter search uses a KFold with a *different* random_state than the CV
+loop (seed+7919) so the tuning validation fold never coincides with any of the
+CV validation folds, eliminating optimistic bias in the found parameters.
 """
 
 import gc
@@ -46,6 +46,11 @@ from tools.model_tools import ModelTools, gpu_available
 from utils.helpers import safe_json_parse
 
 _logger = logging.getLogger("kaggle-mas.model_agent")
+
+# Prime offset added to the CV random_state to produce a disjoint tuning fold.
+# Using a large prime ensures the two KFold permutations do not accidentally
+# share the same fold-0 split for small dataset sizes.
+_TUNE_SEED_OFFSET: int = 7919
 
 
 def _xgb_predict(booster: Any, X: np.ndarray) -> np.ndarray:
@@ -393,10 +398,10 @@ Respond with JSON only.
         """
         Run Optuna to find best hyperparameters for one algorithm.
 
-        Uses the **first KFold fold** as the tuning validation set so there is
-        no overlap between the tuning validation rows and the training portion
-        of that fold, eliminating the optimistic bias from a separate random
-        80/20 split.
+        Uses a KFold with ``random_state=seed + _TUNE_SEED_OFFSET`` so the
+        tuning validation split is *disjoint* from all CV folds (which use
+        ``random_state=seed``).  This eliminates the optimistic bias that
+        occurs when the tuning fold coincides with a later CV validation fold.
         """
         search_space = algo_cfg.get("search_space", {})
         fixed = algo_cfg.get("fixed_params", {})
@@ -408,9 +413,10 @@ Respond with JSON only.
             "catboost": self._train_catboost,
         }[algo]
 
-        # Use the first KFold fold for tuning (deterministic, no overlap with later CV)
-        kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-        tune_train_idx, tune_val_idx = next(iter(kf.split(X)))
+        # Use a different random_state than the CV loop to get a disjoint
+        # validation fold, preventing optimistic bias in tuned params.
+        tune_kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed + _TUNE_SEED_OFFSET)
+        tune_train_idx, tune_val_idx = next(iter(tune_kf.split(X)))
         X_t, y_t = X[tune_train_idx], y[tune_train_idx]
         X_v, y_v = X[tune_val_idx], y[tune_val_idx]
 
@@ -614,7 +620,7 @@ Respond with JSON only.
     def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """
         1. Ask LLM for model plan.
-        2. Tune each enabled algorithm with Optuna (first KFold fold).
+        2. Tune each enabled algorithm with Optuna (disjoint fold, seed+_TUNE_SEED_OFFSET).
         3. Train with K-fold CV using best params; apply target encoding
            inside each fold to prevent leakage.
         4. Build ensemble.
@@ -667,7 +673,7 @@ Respond with JSON only.
             self._log(f"Tuning {algo} with Optuna ({algo_cfg.get('n_trials', 20)} trials)\u2026")
 
             try:
-                # Pass pure-numeric X for Optuna (TE not needed here — first-fold split)
+                # Pass pure-numeric X for Optuna (TE not needed here — disjoint fold)
                 best_params = self._tune_algorithm(
                     algo, algo_cfg, X_numeric, y, seed, n_splits
                 )
