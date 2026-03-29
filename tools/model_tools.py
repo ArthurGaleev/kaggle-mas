@@ -35,6 +35,28 @@ def _gpu_available() -> bool:
     return False
 
 
+def _count_gpus() -> int:
+    """Return the number of available CUDA GPUs (0 if none)."""
+    try:
+        import torch
+        return torch.cuda.device_count()
+    except ImportError:
+        pass
+    # Fallback: parse nvidia-smi
+    import shutil, subprocess
+    if shutil.which("nvidia-smi"):
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, check=True, text=True,
+            )
+            count = len([l for l in result.stdout.strip().splitlines() if l.strip()])
+            return count
+        except Exception:
+            pass
+    return 0
+
+
 def _ensure_opencl_icd() -> None:
     """Set up the NVIDIA OpenCL ICD required by LightGBM GPU on Colab/Kaggle."""
     import os, pathlib
@@ -60,6 +82,7 @@ def _ensure_opencl_icd() -> None:
 
 
 _GPU_READY: bool | None = None
+_GPU_COUNT: int | None = None
 
 
 def gpu_available() -> bool:
@@ -71,6 +94,15 @@ def gpu_available() -> bool:
             _ensure_opencl_icd()
         logger.info("GPU available: %s", _GPU_READY)
     return _GPU_READY
+
+
+def gpu_count() -> int:
+    """Cached GPU device count (called once per process)."""
+    global _GPU_COUNT
+    if _GPU_COUNT is None:
+        _GPU_COUNT = _count_gpus() if gpu_available() else 0
+        logger.info("GPU count: %d", _GPU_COUNT)
+    return _GPU_COUNT
 
 
 def _lgb_val_mse(booster: Any) -> float:
@@ -109,6 +141,16 @@ class ModelTools:
     ensemble creation, and model serialisation.
 
     All methods are ``@staticmethod`` — no instance is needed.
+
+    Multi-GPU support
+    -----------------
+    When multiple CUDA GPUs are detected (e.g. 2x T4 on Kaggle):
+
+    - **LightGBM**: ``num_gpu`` is set to the device count (``device='gpu'``).
+    - **XGBoost** (≥2.0): ``n_gpus=-1`` instructs XGBoost to use all available
+      CUDA devices.  ``tree_method='hist'`` is kept for compatibility.
+    - **CatBoost**: ``devices`` is set to ``"0:<n-1>"`` (range notation) to
+      span all GPUs.
 
     Examples
     --------
@@ -171,11 +213,22 @@ class ModelTools:
         params.setdefault("verbosity",  -1)
         params.setdefault("seed",       42)
 
-        # GPU acceleration
+        # GPU acceleration — multi-GPU aware
         if gpu_available() and "device" not in params:
             params["device"] = "gpu"
             params.setdefault("gpu_use_dp", False)
-            logger.info("[ModelTools] LightGBM using GPU.")
+            n_gpus = gpu_count()
+            if n_gpus > 1:
+                params.setdefault("num_gpu", n_gpus)
+                logger.info("[ModelTools] LightGBM using %d GPUs.", n_gpus)
+            else:
+                logger.info("[ModelTools] LightGBM using GPU.")
+        elif gpu_available() and params.get("device") == "gpu":
+            # device already set by caller; still honour multi-GPU
+            n_gpus = gpu_count()
+            if n_gpus > 1:
+                params.setdefault("num_gpu", n_gpus)
+                logger.info("[ModelTools] LightGBM using %d GPUs (device preset by caller).", n_gpus)
 
         dtrain = lgb.Dataset(X_train, label=y_train)
         dval   = lgb.Dataset(X_val,   label=y_val, reference=dtrain)
@@ -245,11 +298,24 @@ class ModelTools:
         params.setdefault("seed",        42)
         params.setdefault("verbosity",   0)
 
-        # GPU acceleration
+        # GPU acceleration — multi-GPU aware
         if gpu_available() and "device" not in params:
             params["device"] = "cuda"
             params.setdefault("tree_method", "hist")
-            logger.info("[ModelTools] XGBoost using GPU (cuda).")
+            n_gpus = gpu_count()
+            if n_gpus > 1:
+                # XGBoost >=2.0: n_gpus=-1 means use all available GPUs
+                params.setdefault("n_gpus", -1)
+                logger.info("[ModelTools] XGBoost using %d GPUs (n_gpus=-1).", n_gpus)
+            else:
+                logger.info("[ModelTools] XGBoost using GPU (cuda).")
+        elif gpu_available() and params.get("device") == "cuda":
+            # device already set by caller; still honour multi-GPU
+            n_gpus = gpu_count()
+            if n_gpus > 1:
+                params.setdefault("n_gpus", -1)
+                params.setdefault("tree_method", "hist")
+                logger.info("[ModelTools] XGBoost using %d GPUs (device preset by caller).", n_gpus)
 
         dtrain = xgb.DMatrix(X_train, label=y_train)
         dval   = xgb.DMatrix(X_val,   label=y_val)
@@ -317,11 +383,23 @@ class ModelTools:
         params.setdefault("random_seed",    42)
         params.setdefault("verbose",        0)
 
-        # GPU acceleration
+        # GPU acceleration — multi-GPU aware
         if gpu_available() and "task_type" not in params:
             params["task_type"] = "GPU"
-            params.setdefault("devices", "0")
-            logger.info("[ModelTools] CatBoost using GPU.")
+            n_gpus = gpu_count()
+            if n_gpus > 1:
+                # CatBoost range notation: "0:N-1" spans devices 0 through N-1
+                params.setdefault("devices", f"0:{n_gpus - 1}")
+                logger.info("[ModelTools] CatBoost using %d GPUs (devices=0:%d).", n_gpus, n_gpus - 1)
+            else:
+                params.setdefault("devices", "0")
+                logger.info("[ModelTools] CatBoost using GPU.")
+        elif gpu_available() and params.get("task_type") == "GPU":
+            # task_type already set by caller; still honour multi-GPU
+            n_gpus = gpu_count()
+            if n_gpus > 1 and "devices" not in params:
+                params["devices"] = f"0:{n_gpus - 1}"
+                logger.info("[ModelTools] CatBoost using %d GPUs (task_type preset by caller).", n_gpus)
 
         train_pool = Pool(X_train, label=y_train)
         val_pool   = Pool(X_val,   label=y_val)
@@ -670,4 +748,4 @@ class ModelTools:
         return model
 
 
-__all__ = ["ModelTools"]
+__all__ = ["ModelTools", "gpu_available", "gpu_count"]
