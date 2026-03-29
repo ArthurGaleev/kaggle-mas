@@ -204,11 +204,13 @@ Respond with JSON only.
                         "device": "gpu",
                         "n_estimators": 1000,
                         "early_stopping_rounds": 50,
+                        "bagging_freq": 1,  # Required for bagging_fraction to take effect
                     },
                     "search_space": {
                         "num_leaves":        {"type": "int",   "low": 31,   "high": 255},
                         "learning_rate":     {"type": "float", "low": 0.01, "high": 0.3,  "log": True},
                         "feature_fraction":  {"type": "float", "low": 0.5,  "high": 1.0},
+                        "bagging_fraction":  {"type": "float", "low": 0.5,  "high": 1.0},
                         "min_child_samples": {"type": "int",   "low": 20,   "high": 200},
                         "reg_alpha":         {"type": "float", "low": 1e-8, "high": 10.0, "log": True},
                         "reg_lambda":        {"type": "float", "low": 1e-8, "high": 10.0, "log": True},
