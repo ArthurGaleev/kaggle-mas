@@ -160,7 +160,7 @@ Respond with JSON only.
         for df in (train, test):
             if col not in df.columns:
                 continue
-            dt = pd.to_datetime(df[col], errors="coerce")
+            dt = pd.to_datetime(df[col], errors="coerce", format="mixed")
             df["dt_year"] = dt.dt.year.fillna(0).astype(int)
             df["dt_month"] = dt.dt.month.fillna(0).astype(int)
             df["dt_day_of_week"] = dt.dt.dayofweek.fillna(0).astype(int)
@@ -281,6 +281,10 @@ Respond with JSON only.
             feat = f"te_{col}"
             train[feat] = train[col].map(mapping).fillna(global_mean)
             test[feat] = test[col].map(mapping).fillna(global_mean)
+
+        # Drop original categorical columns (now encoded)
+        train.drop(columns=[c for c in cat_cols if c in train.columns], inplace=True)
+        test.drop(columns=[c for c in cat_cols if c in test.columns], inplace=True)
 
         return train, test
 

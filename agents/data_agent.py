@@ -211,7 +211,12 @@ Schema:
     "col_name": "datetime" | "int" | "float" | "str" | "category"
   }}
 }}
-Only include keys that need action. For columns with no nulls and correct types, omit them.
+
+IMPORTANT rules:
+- Date/datetime columns (e.g. 'last_dt') should NOT be imputed with "unknown". Leave them as NaN; the feature engineer will extract datetime features and handle NaT.
+- For numeric columns with missing values, prefer "median" or "zero".
+- Use "unknown" only for text/categorical (object dtype) columns.
+- Only include keys that need action. For columns with no nulls and correct types, omit them.
 Respond with JSON only.
 """
         default_plan: Dict[str, Any] = {
@@ -287,6 +292,17 @@ Respond with JSON only.
         for col, strategy in imputation_map.items():
             if col not in train.columns:
                 continue
+            col_dtype = train[col].dtype
+            # Skip string imputation for datetime / numeric columns
+            if strategy == "unknown" and (
+                pd.api.types.is_datetime64_any_dtype(col_dtype)
+                or pd.api.types.is_numeric_dtype(col_dtype)
+            ):
+                self._log(
+                    f"Skipping 'unknown' imputation for {col} (dtype={col_dtype}).",
+                    level="warning",
+                )
+                continue
             if strategy == "median":
                 fill_values[col] = train[col].median()
             elif strategy == "mean":
@@ -306,10 +322,16 @@ Respond with JSON only.
                 if col not in df.columns:
                     continue
                 if strategy == "ffill":
-                    df[col].fillna(method="ffill", inplace=True)
-                    df[col].fillna(method="bfill", inplace=True)  # catch leading NaNs
+                    df[col] = df[col].ffill()
+                    df[col] = df[col].bfill()  # catch leading NaNs
                 elif col in fill_values and fill_values[col] is not None:
-                    df[col].fillna(fill_values[col], inplace=True)
+                    fill_val = fill_values[col]
+                    # Cast fill value to compatible dtype to avoid incompatible-dtype warnings
+                    if hasattr(df[col], "dtype") and pd.api.types.is_datetime64_any_dtype(df[col]):
+                        # For datetime columns, convert 'unknown' to NaT instead
+                        if isinstance(fill_val, str):
+                            fill_val = pd.NaT
+                    df[col] = df[col].fillna(fill_val)
 
         return train, test
 

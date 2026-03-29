@@ -34,6 +34,30 @@ def _gpu_available() -> bool:
     return False
 
 
+def _ensure_opencl_icd() -> None:
+    """Set up the NVIDIA OpenCL ICD required by LightGBM GPU on Colab/Kaggle."""
+    import os, pathlib
+    icd_path = pathlib.Path("/etc/OpenCL/vendors/nvidia.icd")
+    if not icd_path.exists():
+        try:
+            icd_path.parent.mkdir(parents=True, exist_ok=True)
+            icd_path.write_text("libnvidia-opencl.so.1\n")
+            logger.info("Created OpenCL ICD at %s (needed for LightGBM GPU).", icd_path)
+        except PermissionError:
+            # Try with subprocess (Colab cells run as root)
+            import subprocess
+            try:
+                subprocess.run(
+                    ["bash", "-c",
+                     "mkdir -p /etc/OpenCL/vendors && "
+                     'echo "libnvidia-opencl.so.1" > /etc/OpenCL/vendors/nvidia.icd'],
+                    check=True, capture_output=True,
+                )
+                logger.info("Created OpenCL ICD via subprocess.")
+            except Exception as e:
+                logger.warning("Could not create OpenCL ICD: %s. LightGBM GPU may fail.", e)
+
+
 _GPU_READY: bool | None = None
 
 
@@ -42,6 +66,8 @@ def gpu_available() -> bool:
     global _GPU_READY
     if _GPU_READY is None:
         _GPU_READY = _gpu_available()
+        if _GPU_READY:
+            _ensure_opencl_icd()
         logger.info("GPU available: %s", _GPU_READY)
     return _GPU_READY
 
