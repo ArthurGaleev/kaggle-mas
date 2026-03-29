@@ -10,6 +10,13 @@ GPU handling is centralised in ``tools.model_tools.ModelTools``:
   - ``gpu_available()``  — cached CUDA probe + OpenCL ICD setup for LightGBM
   - ``ModelTools.train_lightgbm/xgboost/catboost`` — inject the correct
     device/tree_method/task_type param and fall back to CPU transparently.
+
+Log-target transformation:
+  - Before any training, the target is transformed with np.log1p so that
+    right-skewed rental prices are modelled in log space.
+  - All OOF and test predictions are inverted with np.expm1 before metrics
+    are computed, so logged MSE/RMSE values are on the original price scale.
+  - The submission CSV also contains the expm1-inverted predictions.
 """
 
 import gc
@@ -53,20 +60,20 @@ class ModelAgent(BaseAgent):
     Expected state keys consumed:
         train_feat    (pd.DataFrame): engineered feature matrix (train).
         test_feat     (pd.DataFrame): engineered feature matrix (test).
-        target_series (pd.Series):   target values.
+        target_series (pd.Series):   target values (original scale).
         test_ids      (pd.Series):   _id column for submission.
         feature_names (list[str]):   feature column names.
         improvement_plan (dict, opt): hints from OrchestratorAgent.
 
     State keys produced:
         models          (dict):          trained model objects per fold per algorithm.
-        oof_predictions (dict):          out-of-fold predictions per algorithm.
+        oof_predictions (dict):          out-of-fold predictions per algorithm (original scale).
         cv_scores       (dict):          per-fold metrics by model name.
         feature_importances (dict):      mean feature importance per algorithm.
         ensemble_weights (dict):         weights used for ensemble.
-        ensemble_oof    (np.ndarray):    ensemble OOF predictions.
-        test_predictions (dict):         test predictions per algorithm.
-        ensemble_test   (np.ndarray):    weighted ensemble test predictions.
+        ensemble_oof    (np.ndarray):    ensemble OOF predictions (original scale).
+        test_predictions (dict):         test predictions per algorithm (original scale).
+        ensemble_test   (np.ndarray):    weighted ensemble test predictions (original scale).
         submission_df   (pd.DataFrame):  submission-ready DataFrame.
         model_plan      (dict):          LLM-generated model plan.
     """
@@ -251,8 +258,10 @@ Respond with JSON only.
     ) -> Tuple[Any, float]:
         merged = {**fixed, **params}
         model = ModelTools.train_lightgbm(X_train, y_train, X_val, y_val, merged)
-        val_pred = model.predict(X_val)
-        return model, float(mean_squared_error(y_val, val_pred))
+        val_pred_log = model.predict(X_val)
+        val_pred = np.expm1(val_pred_log)
+        y_val_orig = np.expm1(y_val)
+        return model, float(mean_squared_error(y_val_orig, val_pred))
 
     def _train_xgboost(
         self,
@@ -265,8 +274,10 @@ Respond with JSON only.
     ) -> Tuple[Any, float]:
         merged = {**fixed, **params}
         booster = ModelTools.train_xgboost(X_train, y_train, X_val, y_val, merged)
-        val_pred = _xgb_predict(booster, X_val)
-        return booster, float(mean_squared_error(y_val, val_pred))
+        val_pred_log = _xgb_predict(booster, X_val)
+        val_pred = np.expm1(val_pred_log)
+        y_val_orig = np.expm1(y_val)
+        return booster, float(mean_squared_error(y_val_orig, val_pred))
 
     def _train_catboost(
         self,
@@ -279,8 +290,10 @@ Respond with JSON only.
     ) -> Tuple[Any, float]:
         merged = {**fixed, **params}
         model = ModelTools.train_catboost(X_train, y_train, X_val, y_val, merged)
-        val_pred = np.asarray(model.predict(X_val))
-        return model, float(mean_squared_error(y_val, val_pred))
+        val_pred_log = np.asarray(model.predict(X_val))
+        val_pred = np.expm1(val_pred_log)
+        y_val_orig = np.expm1(y_val)
+        return model, float(mean_squared_error(y_val_orig, val_pred))
 
     # ------------------------------------------------------------------
     # Optuna tuning per algorithm
@@ -291,12 +304,13 @@ Respond with JSON only.
         algo: str,
         algo_cfg: Dict[str, Any],
         X: np.ndarray,
-        y: np.ndarray,
+        y_log: np.ndarray,
         seed: int,
     ) -> Dict[str, Any]:
         """
         Run Optuna to find best hyperparameters for one algorithm using
         a single validation fold (not full CV, to stay within Colab time budget).
+        y_log is already log1p-transformed.
         """
         search_space = algo_cfg.get("search_space", {})
         fixed = algo_cfg.get("fixed_params", {})
@@ -312,8 +326,8 @@ Respond with JSON only.
         split_idx = int(len(X) * 0.8)
         idx = np.random.default_rng(seed).permutation(len(X))
         tune_train_idx, tune_val_idx = idx[:split_idx], idx[split_idx:]
-        X_t, y_t = X[tune_train_idx], y[tune_train_idx]
-        X_v, y_v = X[tune_val_idx], y[tune_val_idx]
+        X_t, y_t = X[tune_train_idx], y_log[tune_train_idx]
+        X_v, y_v = X[tune_val_idx], y_log[tune_val_idx]
 
         def objective(trial: optuna.Trial) -> float:
             params = self._sample_params(trial, search_space)
@@ -338,12 +352,7 @@ Respond with JSON only.
     def _predict(model: Any, X: np.ndarray) -> np.ndarray:
         """
         Dispatch prediction to the correct API for each model type.
-
-        - ``xgb.Booster`` requires a ``DMatrix``; passing a raw array raises
-          ``TypeError: Expecting data to be a DMatrix object``.  We detect the
-          Booster type and wrap via :func:`_xgb_predict`.
-        - ``lgb.Booster`` (and sklearn-style models) expose a plain
-          ``predict(array)`` API.
+        Returns raw model output (log space — caller applies expm1).
         """
         try:
             import xgboost as xgb
@@ -359,7 +368,8 @@ Respond with JSON only.
         algo_cfg: Dict[str, Any],
         best_params: Dict[str, Any],
         X: np.ndarray,
-        y: np.ndarray,
+        y_log: np.ndarray,
+        y_orig: np.ndarray,
         X_test: np.ndarray,
         n_splits: int,
         seed: int,
@@ -367,7 +377,8 @@ Respond with JSON only.
     ) -> Dict[str, Any]:
         """
         Train the algorithm with best_params across n_splits folds.
-        Returns OOF preds, fold MSEs, test preds, and feature importances.
+        Returns OOF preds in original scale, fold MSEs on original scale,
+        test preds in original scale, and feature importances.
         """
         fixed = dict(algo_cfg.get("fixed_params", {}))
         train_fn = {
@@ -377,20 +388,22 @@ Respond with JSON only.
         }[algo]
 
         kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-        oof_preds = np.zeros(len(y))
+        oof_preds_orig = np.zeros(len(y_orig))
         test_preds_folds = np.zeros((len(X_test), n_splits))
         fold_mses: List[float] = []
         models: List[Any] = []
         importances: List[np.ndarray] = []
 
         for fold_idx, (train_idx, val_idx) in enumerate(kf.split(X)):
-            X_tr, y_tr = X[train_idx], y[train_idx]
-            X_vl, y_vl = X[val_idx], y[val_idx]
+            X_tr, y_tr = X[train_idx], y_log[train_idx]
+            X_vl, y_vl_log = X[val_idx], y_log[val_idx]
+            y_vl_orig = y_orig[val_idx]
 
-            model, fold_mse = train_fn(X_tr, y_tr, X_vl, y_vl, dict(best_params), dict(fixed))
-            # Use _predict() so xgb.Booster gets a DMatrix, not a raw ndarray
-            oof_preds[val_idx] = self._predict(model, X_vl)
-            test_preds_folds[:, fold_idx] = self._predict(model, X_test)
+            model, fold_mse = train_fn(X_tr, y_tr, X_vl, y_vl_log, dict(best_params), dict(fixed))
+
+            # Predictions in log space, inverted to original scale
+            oof_preds_orig[val_idx] = np.expm1(self._predict(model, X_vl))
+            test_preds_folds[:, fold_idx] = np.expm1(self._predict(model, X_test))
             fold_mses.append(fold_mse)
             models.append(model)
 
@@ -409,7 +422,7 @@ Respond with JSON only.
 
         return {
             "models": models,
-            "oof_predictions": oof_preds,
+            "oof_predictions": oof_preds_orig,
             "test_predictions": test_preds_folds.mean(axis=1),
             "fold_mses": fold_mses,
             "mean_cv_mse": float(np.mean(fold_mses)),
@@ -430,6 +443,7 @@ Respond with JSON only.
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
         """
         Combine per-algorithm OOF and test predictions into a weighted ensemble.
+        All predictions are in original scale.
         """
         algos = list(oof_results.keys())
         mses = np.array([oof_results[a]["mean_cv_mse"] for a in algos])
@@ -464,19 +478,7 @@ Respond with JSON only.
         """
         Build a submission DataFrame with columns ``[index, prediction]``.
 
-        The ``index`` column is a simple integer range from 0 to
-        ``len(test_ensemble) - 1``, matching the row order of the test set.
-        No deduplication or sorting is performed.
-
-        Parameters
-        ----------
-        test_ensemble:
-            Array of ensemble predictions for the test set.
-
-        Returns
-        -------
-        pd.DataFrame
-            Columns: ``index`` (0-based integer), ``prediction`` (float).
+        Predictions are in the original price scale (expm1 already applied).
         """
         return pd.DataFrame(
             {
@@ -492,16 +494,23 @@ Respond with JSON only.
     def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """
         1. Ask LLM for model plan.
-        2. Tune each enabled algorithm with Optuna.
-        3. Train with K-fold CV using best params.
-        4. Build ensemble.
-        5. Populate state with submission_df (saving to disk is main.py's responsibility).
+        2. Apply log1p to the target (train in log space).
+        3. Tune each enabled algorithm with Optuna.
+        4. Train with K-fold CV using best params.
+        5. Invert predictions with expm1 (all OOF/test back to original scale).
+        6. Build ensemble and submission.
         """
         X: np.ndarray = state["train_feat"].values.astype(np.float32)
-        y: np.ndarray = state["target_series"].values.astype(np.float32)
+        y_orig: np.ndarray = state["target_series"].values.astype(np.float32)
         X_test: np.ndarray = state["test_feat"].values.astype(np.float32)
         test_ids: pd.Series = state["test_ids"]
         feature_names: List[str] = state["feature_names"]
+
+        # --- Log-transform the target ---
+        # Training is done in log space; all predictions are inverted with expm1.
+        y_log: np.ndarray = np.log1p(y_orig.clip(min=0)).astype(np.float32)
+        self._log(f"Target log1p applied. y_orig range: [{y_orig.min():.2f}, {y_orig.max():.2f}] "
+                  f"y_log range: [{y_log.min():.4f}, {y_log.max():.4f}]")
 
         # Log GPU status once at the start (uses cached check from ModelTools)
         _logger.info("[GPU] GPU available: %s", gpu_available())
@@ -525,7 +534,7 @@ Respond with JSON only.
             self._log(f"Tuning {algo} with Optuna ({algo_cfg.get('n_trials', 20)} trials)\u2026")
 
             try:
-                best_params = self._tune_algorithm(algo, algo_cfg, X, y, seed)
+                best_params = self._tune_algorithm(algo, algo_cfg, X, y_log, seed)
             except Exception as exc:
                 self._log(f"Optuna tuning failed for {algo}: {exc}. Using fixed params.", level="warning")
                 best_params = {}
@@ -533,7 +542,7 @@ Respond with JSON only.
             self._log(f"CV training {algo}\u2026")
             try:
                 result = self._cross_validate_algorithm(
-                    algo, algo_cfg, best_params, X, y, X_test, n_splits, seed, feature_names
+                    algo, algo_cfg, best_params, X, y_log, y_orig, X_test, n_splits, seed, feature_names
                 )
                 oof_results[algo] = result
                 test_predictions[algo] = result["test_predictions"]
@@ -549,14 +558,14 @@ Respond with JSON only.
         if not oof_results:
             raise RuntimeError("No models trained successfully.")
 
-        # --- Ensemble ---
+        # --- Ensemble (all predictions already in original scale) ---
         oof_ensemble, test_ensemble, ensemble_weights = self._build_ensemble(
-            oof_results, test_predictions, y, method=ensemble_method
+            oof_results, test_predictions, y_orig, method=ensemble_method
         )
-        ensemble_mse = float(mean_squared_error(y, oof_ensemble))
-        self._log(f"Ensemble OOF MSE={ensemble_mse:.4f}")
+        ensemble_mse = float(mean_squared_error(y_orig, oof_ensemble))
+        self._log(f"Ensemble OOF MSE={ensemble_mse:.4f} (original price scale)")
 
-        # --- Submission --- (saving to disk is owned by main.py)
+        # --- Submission ---
         submission = self._build_submission(test_ensemble)
 
         # --- Store in state ---
