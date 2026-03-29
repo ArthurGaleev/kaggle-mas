@@ -1,0 +1,42 @@
+provider: "local"
+# Model name to load from HuggingFace Hub.
+# Override at CLI with: python main.py llm=local_hf llm.model=<model_id>
+# Examples:
+#   meta-llama/Llama-3.3-70B-Instruct   (free, gated — needs HF_TOKEN)
+#   Qwen/Qwen3-80B-A3B-Instruct          (free, MoE — only ~3B active params)
+#   Qwen/Qwen2.5-72B-Instruct            (free, gated)
+model: "meta-llama/Llama-3.3-70B-Instruct"
+fallback_model: "Qwen/Qwen2.5-7B-Instruct"
+api_key_env: "HF_TOKEN"           # used to download gated models from the Hub
+temperature: 0.1
+max_tokens: 4096
+
+# ── Local loading options ─────────────────────────────────────────────────
+local:
+  # 4-bit NF4 quantization via bitsandbytes.
+  # Required to fit 70-80B models into Kaggle's 2×15 GB T4 GPUs (30 GB total).
+  # Memory estimates at NF4 + double-quant:
+  #   Llama-3.3-70B  → ~28-30 GB  ✓  (tight, needs both T4s)
+  #   Qwen3-80B-A3B  → ~10-12 GB  ✓  (MoE: only ~3B active params per token)
+  load_in_4bit: true
+  bnb_4bit_compute_dtype: "float16"   # float16 is fastest on T4
+  bnb_4bit_use_double_quant: true     # saves ~0.4 extra bits/param
+  bnb_4bit_quant_type: "nf4"         # NormalFloat4 — best quality at 4-bit
+
+  # device_map="auto" lets HF Accelerate automatically split model layers
+  # across all visible GPUs — no manual CUDA device assignment needed.
+  device_map: "auto"
+
+  # Hard cap on per-GPU VRAM allocation (leave ~1 GB headroom for activations).
+  # Accelerate will overflow extra layers to CPU RAM if needed.
+  max_memory_per_gpu: "14GiB"
+
+  # Set to true if flash-attn is installed (pip install flash-attn).
+  # Speeds up inference and reduces memory, but requires Ampere+ GPU.
+  # T4 is Turing (sm75) — flash-attn v2 is NOT supported, keep false.
+  use_flash_attention: false
+
+  # Sampling parameters
+  do_sample: true
+  top_p: 0.9
+  repetition_penalty: 1.1

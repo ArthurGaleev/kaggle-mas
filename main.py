@@ -6,11 +6,19 @@ Usage:
   # Default (Groq LLM):
   python main.py
 
-  # With HuggingFace:
+  # With HuggingFace Inference API:
   python main.py llm=huggingface
 
   # With OpenRouter:
   python main.py llm=openrouter
+
+  # Local large model on Kaggle 2\u00d7T4 GPUs (4-bit NF4 + device_map=auto):
+  python main.py llm=local_hf
+
+  # Specify a different local model at runtime:
+  python main.py llm=local_hf llm.model=meta-llama/Llama-3.3-70B-Instruct
+  python main.py llm=local_hf llm.model=Qwen/Qwen3-80B-A3B-Instruct
+  python main.py llm=local_hf llm.model=Qwen/Qwen2.5-72B-Instruct
 
   # Fast pipeline (debug):
   python main.py pipeline=fast
@@ -19,9 +27,18 @@ Usage:
   python main.py pipeline.max_feedback_loops=5 models.lightgbm.params.n_estimators=2000
 
 Install dependencies (Colab/Kaggle):
-  !pip install langgraph omegaconf hydra-core lightgbm xgboost catboost \
-               optuna scikit-learn pandas numpy sentence-transformers faiss-cpu \
+  !pip install langgraph omegaconf hydra-core lightgbm xgboost catboost \\
+               optuna scikit-learn pandas numpy sentence-transformers faiss-cpu \\
                matplotlib psutil openai
+
+  # Extra deps for local large models (provider=local):
+  !pip install -q transformers>=4.40.0 accelerate>=0.30.0 bitsandbytes>=0.43.0
+
+Notes on local model GPU memory (Kaggle 2\u00d7T4, 15 GB each = 30 GB total):
+  Llama-3.3-70B-Instruct  : ~28-30 GB at NF4 + double-quant  (needs both T4s)
+  Qwen3-80B-A3B-Instruct  : ~10-12 GB at NF4                 (MoE, 3B active params)
+  Qwen2.5-72B-Instruct    : ~28-30 GB at NF4 + double-quant  (needs both T4s)
+  Qwen2.5-7B-Instruct     : ~4  GB  in FP16                  (single T4, fallback)
 """
 from __future__ import annotations
 
@@ -110,12 +127,12 @@ def _extract_zip(data_dir: str) -> None:
     # Skip extraction if CSV files already exist
     csv_files = list(data_path.glob("*.csv"))
     if csv_files:
-        logger.info("CSV files already present (%d files) — skipping extraction.", len(csv_files))
+        logger.info("CSV files already present (%d files) \u2014 skipping extraction.", len(csv_files))
         return
 
     zip_files = list(data_path.glob("*.zip"))
     if not zip_files:
-        logger.info("No zip files found in %s — assuming data is ready.", data_dir)
+        logger.info("No zip files found in %s \u2014 assuming data is ready.", data_dir)
         return
 
     for zf_path in zip_files:
@@ -133,7 +150,7 @@ def _ensure_data(cfg: DictConfig) -> str:
     Ensure competition data is present in *cfg.project.data_dir*.
 
     Strategy:
-    1. If ``train.csv`` / ``test.csv`` already exist → nothing to do.
+    1. If ``train.csv`` / ``test.csv`` already exist \u2192 nothing to do.
     2. Attempt Kaggle CLI download.
     3. Extract any zip archives.
     4. If still missing, log a helpful message pointing to manual upload.
@@ -192,7 +209,7 @@ def _print_results_summary(final_state: Dict[str, Any]) -> None:
     """Print a human-readable results summary to stdout."""
     sep = "=" * 60
     print(f"\n{sep}")
-    print("  MULTI-AGENT ML PIPELINE — RESULTS SUMMARY")
+    print("  MULTI-AGENT ML PIPELINE \u2014 RESULTS SUMMARY")
     print(sep)
 
     # Evaluation report
@@ -203,7 +220,7 @@ def _print_results_summary(final_state: Dict[str, Any]) -> None:
         print(f"    MSE  : {ens.get('mse',  'N/A')}")
         print(f"    RMSE : {ens.get('rmse', 'N/A')}")
         print(f"    MAE  : {ens.get('mae',  'N/A')}")
-        print(f"    R²   : {ens.get('r2',   'N/A')}")
+        print(f"    R\u00b2   : {ens.get('r2',   'N/A')}")
 
         per_algo = eval_report.get("per_algorithm", {})
         if per_algo:
@@ -251,7 +268,7 @@ def _save_submission(final_state: Dict[str, Any], output_dir: str) -> Optional[s
     """
     submission_df = final_state.get("submission_df")
     if submission_df is None:
-        logger.warning("No submission_df in final state — skipping submission save.")
+        logger.warning("No submission_df in final state \u2014 skipping submission save.")
         return None
 
     out_path = Path(output_dir)
@@ -261,7 +278,7 @@ def _save_submission(final_state: Dict[str, Any], output_dir: str) -> Optional[s
     try:
         submission_df.to_csv(csv_path, index=False)
         logger.info("Submission saved to %s (%d rows).", csv_path, len(submission_df))
-        print(f"  Submission saved → {csv_path}")
+        print(f"  Submission saved \u2192 {csv_path}")
         return str(csv_path)
     except Exception as exc:
         logger.error("Failed to save submission: %s", exc)
@@ -281,7 +298,7 @@ def _generate_dashboard(final_state: Dict[str, Any], output_dir: str) -> None:
 
         tracker = final_state.get("tracker")
         if tracker is None:
-            logger.warning("No tracker in final state — skipping dashboard.")
+            logger.warning("No tracker in final state \u2014 skipping dashboard.")
             return
 
         dashboard = MetricsDashboard()
@@ -308,10 +325,10 @@ def _generate_dashboard(final_state: Dict[str, Any], output_dir: str) -> None:
             y_true=y_true,
             y_pred=y_pred,
         )
-        print(f"  Dashboard plots saved ({len(saved_plots)} files) → {output_dir}")
+        print(f"  Dashboard plots saved ({len(saved_plots)} files) \u2192 {output_dir}")
 
     except ImportError as exc:
-        logger.warning("matplotlib not available — skipping dashboard: %s", exc)
+        logger.warning("matplotlib not available \u2014 skipping dashboard: %s", exc)
     except Exception as exc:
         logger.error("Dashboard generation failed: %s", exc, exc_info=True)
 
