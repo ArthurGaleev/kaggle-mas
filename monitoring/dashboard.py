@@ -23,6 +23,38 @@ logger = logging.getLogger(__name__)
 matplotlib.use("Agg")
 
 
+def _extract_importance_value(v: Any) -> float:
+    """
+    Normalise a raw importance value to a plain ``float``.
+
+    LightGBM feature-importance dicts (and similar nested structures) can
+    store per-type breakdowns instead of a single scalar::
+
+        {"split": 42, "gain": 3.7}
+
+    Priority order: ``"gain"`` > ``"split"`` > first numeric value found.
+    Falls back to 0.0 when the value cannot be converted.
+    """
+    if isinstance(v, dict):
+        for key in ("gain", "split"):
+            if key in v:
+                try:
+                    return float(v[key])
+                except (TypeError, ValueError):
+                    pass
+        # Last resort: first numeric value in the dict
+        for candidate in v.values():
+            try:
+                return float(candidate)
+            except (TypeError, ValueError):
+                pass
+        return 0.0
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class MetricsDashboard:
     """Generates diagnostic plots for pipeline runs.
 
@@ -132,7 +164,7 @@ class MetricsDashboard:
 
     def plot_feature_importance(
         self,
-        importance_dict: Dict[str, float],
+        importance_dict: Dict[str, Any],
         top_n: int = 20,
         title: str = "Feature Importance",
     ) -> plt.Figure:
@@ -141,7 +173,11 @@ class MetricsDashboard:
         Parameters
         ----------
         importance_dict:
-            Mapping of feature name → importance score.
+            Mapping of feature name → importance score.  Values may be plain
+            ``float`` / ``int``, or a dict produced by LightGBM / other
+            libraries (e.g. ``{"gain": 3.7, "split": 42}``).  In the latter
+            case the ``"gain"`` key is preferred; see
+            :func:`_extract_importance_value` for the full resolution order.
         top_n:
             Number of top features to display.
         title:
@@ -158,8 +194,15 @@ class MetricsDashboard:
             ax.set_title(title)
             return fig
 
+        # Normalise all values to float before sorting so nested dicts do not
+        # cause a TypeError in the comparator or in np.array(dtype=float).
+        normalised: Dict[str, float] = {
+            k: _extract_importance_value(v)
+            for k, v in importance_dict.items()
+        }
+
         # Sort and select top N
-        sorted_items = sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)
+        sorted_items = sorted(normalised.items(), key=lambda x: x[1], reverse=True)
         top_items = sorted_items[:top_n]
         features = [item[0] for item in reversed(top_items)]
         values = [item[1] for item in reversed(top_items)]
@@ -404,7 +447,7 @@ class MetricsDashboard:
         self,
         tracker: Any,
         output_dir: str,
-        importance_dict: Optional[Dict[str, float]] = None,
+        importance_dict: Optional[Dict[str, Any]] = None,
         y_true: Optional[Any] = None,
         y_pred: Optional[Any] = None,
     ) -> List[str]:
@@ -418,6 +461,7 @@ class MetricsDashboard:
             Directory where PNG files will be written.
         importance_dict:
             Optional feature importance dict for the feature importance plot.
+            Values may be plain floats or nested dicts (e.g. from LightGBM).
         y_true:
             Optional ground-truth array for the residual plot.
         y_pred:
