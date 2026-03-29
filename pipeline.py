@@ -48,6 +48,7 @@ Install dependencies:
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -134,9 +135,20 @@ class PipelineState(TypedDict, total=False):
 # Node factories
 # ---------------------------------------------------------------------------
 
+# Explicit mapping from agent class name to RAG context key suffix.
+# Using a dict avoids brittle string manipulation (e.g. 'Agent'.replace...).
+_AGENT_RAG_KEY: Dict[str, str] = {
+    "DataAgent":          "data",
+    "FeatureAgent":       "feature",
+    "ModelAgent":         "model",
+    "EvaluatorAgent":     "evaluator",
+    "OrchestratorAgent":  "orchestrator",
+}
+
+
 def _make_rag_node(agent_name: str, rag_retriever: Any) -> Any:
     """Return a node function that injects RAG context into state."""
-    ctx_key = f"rag_context_{agent_name.replace('Agent', '').lower()}"
+    ctx_key = f"rag_context_{_AGENT_RAG_KEY.get(agent_name, agent_name.lower())}"
 
     def _node(state: PipelineState) -> PipelineState:  # type: ignore[type-arg]
         try:
@@ -182,6 +194,8 @@ def _make_agent_node(agent: Any, tracker: Any) -> Any:
             errors: List[str] = list(state.get("errors") or [])
             errors.append(f"{phase}: {exc}")
             state["errors"] = errors  # type: ignore[typeddict-unknown-key]
+            state["pipeline_complete"] = True  # type: ignore[typeddict-unknown-key]
+            raise
         tracker.log_memory_snapshot(f"after_{phase}")
 
         # ----------------------------------------------------------------
@@ -276,7 +290,6 @@ def _make_input_guard_node(
         cleaning_plan = state.get("cleaning_plan", {})
         if cleaning_plan:
             try:
-                import json
                 text = json.dumps(cleaning_plan)
                 sanitized = safety_guard.sanitize_llm_response(text)
                 if sanitized != text:
@@ -620,8 +633,8 @@ def run_pipeline(cfg: DictConfig) -> Dict[str, Any]:
                 return True, []
 
         class _PassSafety:
-            def scan(self, text):
-                return True, []
+            def sanitize_llm_response(self, text):
+                return text
 
         input_validator  = _PassValidator()   # type: ignore[assignment]
         output_validator = _PassValidator()   # type: ignore[assignment]

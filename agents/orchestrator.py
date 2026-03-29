@@ -12,7 +12,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 import numpy as np
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from agents.base import BaseAgent
 from utils.helpers import safe_json_parse
@@ -73,7 +73,7 @@ class OrchestratorAgent(BaseAgent):
         report = state.get("evaluation_report", {})
         interpretation = state.get("llm_interpretation", "")
         iteration = state.get("iteration", 0)
-        max_iter = int(self.cfg.get("max_iterations", 3))
+        max_iter = int(OmegaConf.select(self.cfg, "max_iterations", default=3))
         history_summary = self._format_history(state.get("decision_history", []))
 
         ens = report.get("ensemble", {}).get("oof_metrics", {})
@@ -205,6 +205,17 @@ Respond with JSON only.
         """
         Run the complete multi-agent pipeline with the feedback loop.
 
+        .. warning::
+            **Standalone convenience path only.**  This method bypasses the
+            LangGraph topology entirely and wires agents together with direct
+            Python calls.  It exists solely for quick local testing and
+            notebook experiments where LangGraph is not available or not
+            desired.  Any structural change to the graph (new nodes, edges,
+            guard rails, RAG injection, conditional routing) must be made in
+            ``pipeline.build_pipeline()`` — this method will *not* reflect
+            those changes automatically.  Do **not** use ``run_pipeline()``
+            as the authoritative execution path in production.
+
         This convenience method orchestrates DataAgent → FeatureAgent →
         ModelAgent → EvaluatorAgent → (OrchestratorAgent feedback loop).
 
@@ -220,7 +231,7 @@ Respond with JSON only.
         from agents.model_agent import ModelAgent
         from agents.evaluator_agent import EvaluatorAgent
 
-        max_iter = int(self.cfg.get("max_iterations", 3))
+        max_iter = int(OmegaConf.select(self.cfg, "max_iterations", default=3))
         state = dict(initial_state)
         state.setdefault("iteration", 0)
         state.setdefault("decision_history", [])
@@ -233,7 +244,7 @@ Respond with JSON only.
         evaluator_agent = EvaluatorAgent(self.cfg, self.llm_client, self.logger)
 
         # --- Initial pipeline run ---
-        self._log("Starting initial pipeline run…")
+        self._log("Starting initial pipeline run\u2026")
         state = data_agent._timed_execute(state)
         state = feature_agent._timed_execute(state)
         state = model_agent._timed_execute(state)
@@ -284,7 +295,7 @@ Respond with JSON only.
         pipeline loop use run_pipeline().
         """
         iteration = state.get("iteration", 0)
-        max_iter = int(self.cfg.get("max_iterations", 3))
+        max_iter = int(OmegaConf.select(self.cfg, "max_iterations", default=3))
 
         # Hard limit check
         if iteration >= max_iter:
@@ -345,7 +356,7 @@ Respond with JSON only.
             state = self._inject_improvement_plan(state, improvement_plan)
             state = self._clear_stale_results(state, next_agent)
             self._log(
-                f"Decision: IMPROVE → {next_agent}. "
+                f"Decision: IMPROVE \u2192 {next_agent}. "
                 f"Plan: {improvement_plan.get('summary', 'no summary')}"
             )
 

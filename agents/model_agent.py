@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import optuna
 import pandas as pd
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import KFold
 
@@ -292,7 +292,6 @@ Respond with JSON only.
         algo_cfg: Dict[str, Any],
         X: np.ndarray,
         y: np.ndarray,
-        n_splits: int,
         seed: int,
     ) -> Dict[str, Any]:
         """
@@ -402,7 +401,8 @@ Respond with JSON only.
                 importances.append(model.feature_importance())
 
             self._log(f"[{algo}] Fold {fold_idx+1}/{n_splits} MSE={fold_mse:.4f}")
-            gc.collect()
+
+        gc.collect()
 
         mean_imp = np.mean(importances, axis=0) if importances else np.zeros(len(feature_names))
         imp_dict = dict(zip(feature_names, mean_imp.tolist()))
@@ -495,7 +495,7 @@ Respond with JSON only.
         2. Tune each enabled algorithm with Optuna.
         3. Train with K-fold CV using best params.
         4. Build ensemble.
-        5. Generate submission.csv.
+        5. Populate state with submission_df (saving to disk is main.py's responsibility).
         """
         X: np.ndarray = state["train_feat"].values.astype(np.float32)
         y: np.ndarray = state["target_series"].values.astype(np.float32)
@@ -510,7 +510,7 @@ Respond with JSON only.
         plan = self._request_model_plan(state)
         state["model_plan"] = plan
         models_cfg: Dict[str, Any] = plan.get("models", {})
-        n_splits: int = int(plan.get("cv_folds", self.cfg.get("cv_folds", 5)))
+        n_splits: int = int(plan.get("cv_folds", OmegaConf.select(self.cfg, "cv_folds", default=5)))
         ensemble_method: str = plan.get("ensemble_method", "inverse_mse")
         seed: int = int(plan.get("random_seed", 42))
 
@@ -525,7 +525,7 @@ Respond with JSON only.
             self._log(f"Tuning {algo} with Optuna ({algo_cfg.get('n_trials', 20)} trials)\u2026")
 
             try:
-                best_params = self._tune_algorithm(algo, algo_cfg, X, y, n_splits, seed)
+                best_params = self._tune_algorithm(algo, algo_cfg, X, y, seed)
             except Exception as exc:
                 self._log(f"Optuna tuning failed for {algo}: {exc}. Using fixed params.", level="warning")
                 best_params = {}
@@ -543,8 +543,8 @@ Respond with JSON only.
             except Exception as exc:
                 self._log(f"CV training failed for {algo}: {exc}", level="error")
                 continue
-            finally:
-                gc.collect()
+
+        gc.collect()
 
         if not oof_results:
             raise RuntimeError("No models trained successfully.")
@@ -556,14 +556,8 @@ Respond with JSON only.
         ensemble_mse = float(mean_squared_error(y, oof_ensemble))
         self._log(f"Ensemble OOF MSE={ensemble_mse:.4f}")
 
-        # --- Submission ---
-        # Columns: index (0..N-1), prediction — row order matches test set
+        # --- Submission --- (saving to disk is owned by main.py)
         submission = self._build_submission(test_ensemble)
-        output_dir = Path(self.cfg.get("output_dir", "output"))
-        output_dir.mkdir(parents=True, exist_ok=True)
-        sub_path = output_dir / "submission.csv"
-        submission.to_csv(sub_path, index=False)
-        self._log(f"Submission saved to {sub_path}")
 
         # --- Store in state ---
         state["models"] = {a: r["models"] for a, r in oof_results.items()}
@@ -580,5 +574,4 @@ Respond with JSON only.
         state["submission_df"] = submission
         state["ensemble_cv_mse"] = ensemble_mse
 
-        gc.collect()
         return state
