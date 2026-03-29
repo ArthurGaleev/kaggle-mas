@@ -16,6 +16,24 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Dtypes that are valid in a cleaned dataset DataFrame.
+# Datetime columns (e.g. last_dt) are legitimate after type conversion;
+# include the common datetime64 resolutions and their tz-aware variants.
+_DEFAULT_ALLOWED_DTYPES: frozenset = frozenset({
+    "int64", "int32", "int16", "int8",
+    "float64", "float32",
+    "object",
+    "bool",
+    "category",
+    # datetime variants produced by pd.to_datetime()
+    "datetime64[ns]",
+    "datetime64[us]",
+    "datetime64[ms]",
+    "datetime64[s]",
+    # tz-aware variants (str repr looks like "datetime64[ns, UTC]")
+    # matched via startswith check in validate_dataset
+})
+
 
 class InputValidator:
     """Validates pipeline inputs: datasets, feature matrices, and LLM outputs.
@@ -71,9 +89,7 @@ class InputValidator:
         target_col: Optional[str] = cfg_dict.get("target_col", None)
         id_col: Optional[str] = cfg_dict.get("id_col", None)
         max_mb: float = cfg_dict.get("max_file_size_mb", 500.0)
-        allowed_dtypes: set = cfg_dict.get(
-            "allowed_dtypes", {"int64", "int32", "float64", "float32", "object", "bool", "category"}
-        )
+        allowed_dtypes: set = cfg_dict.get("allowed_dtypes", _DEFAULT_ALLOWED_DTYPES)
 
         n_rows, n_cols = df.shape
 
@@ -94,10 +110,14 @@ class InputValidator:
             issues.append(f"Completely empty columns: {empty_cols}.")
 
         # Dtype check
+        # tz-aware datetime dtypes have a string repr like "datetime64[ns, UTC]"
+        # which won't match the bare token in allowed_dtypes, so we also accept
+        # any dtype string that starts with "datetime64".
         bad_dtypes = [
             f"{c} ({df[c].dtype})"
             for c in df.columns
             if str(df[c].dtype) not in allowed_dtypes
+            and not str(df[c].dtype).startswith("datetime64")
         ]
         if bad_dtypes:
             issues.append(f"Columns with disallowed dtypes: {bad_dtypes[:10]}.")
