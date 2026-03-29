@@ -635,7 +635,7 @@ Respond with JSON only.
                     [test_results[a] for a in algos]
                 )
 
-                meta = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0])
+                meta = RidgeCV(alphas=[0.001, 0.01, 0.1, 1.0, 10.0, 100.0])
 
                 # Use cross_val_predict for OOF ensemble to avoid leakage.
                 # Fitting RidgeCV on oof_matrix and predicting on the SAME
