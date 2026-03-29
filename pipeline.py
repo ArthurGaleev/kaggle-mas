@@ -110,7 +110,7 @@ class PipelineState(TypedDict, total=False):
     cv_scores: Dict                      # per-fold metrics by model name
     feature_importances: Dict            # feature importance dict
     ensemble_weights: Dict               # weights for ensemble
-    ensemble_oof: Any                    # np.ndarray (ensemble OOF)
+    ensemble_oof: Any                    # np.ndarray (ensemble OOF predictions)
     test_predictions: Dict               # per-model test predictions
     ensemble_test: Any                   # np.ndarray (ensemble test preds)
     submission_df: Any                   # pd.DataFrame ready for submission
@@ -157,7 +157,17 @@ def _make_rag_node(agent_name: str, rag_retriever: Any) -> Any:
 
 
 def _make_agent_node(agent: Any, tracker: Any) -> Any:
-    """Return a node function wrapping agent.execute(state)."""
+    """Return a node function wrapping agent.execute(state).
+
+    After ModelAgent finishes, every per-fold validation MSE stored in
+    ``state["cv_scores"]`` is forwarded to ``tracker.log_model_metric`` so
+    that ``model_comparison.png`` is populated correctly.
+
+    After OrchestratorAgent finishes, the latest entry appended to
+    ``state["decision_history"]`` is forwarded to
+    ``tracker.log_feedback_iteration`` so that
+    ``feedback_loop_progress.png`` is populated correctly.
+    """
 
     def _node(state: PipelineState) -> PipelineState:  # type: ignore[type-arg]
         phase = agent.name
@@ -173,6 +183,68 @@ def _make_agent_node(agent: Any, tracker: Any) -> Any:
             errors.append(f"{phase}: {exc}")
             state["errors"] = errors  # type: ignore[typeddict-unknown-key]
         tracker.log_memory_snapshot(f"after_{phase}")
+
+        # ----------------------------------------------------------------
+        # Forward model CV metrics to the tracker so the dashboard plots
+        # can render model_comparison.png after a reload.
+        # ----------------------------------------------------------------
+        if phase == "ModelAgent":
+            cv_scores: Dict[str, Any] = state.get("cv_scores") or {}
+            for model_name, scores in cv_scores.items():
+                fold_mses = scores.get("fold_mses", [])
+                for fold_idx, mse_val in enumerate(fold_mses):
+                    try:
+                        tracker.log_model_metric(
+                            model_name=model_name,
+                            metric_name="mse",
+                            value=float(mse_val),
+                            fold=fold_idx,
+                            split="validation",
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to log model metric [%s] fold %d: %s",
+                            model_name, fold_idx, exc,
+                        )
+            # Also log ensemble MSE as a separate model entry
+            ensemble_mse = state.get("ensemble_cv_mse")
+            if ensemble_mse is not None:
+                try:
+                    tracker.log_model_metric(
+                        model_name="ensemble",
+                        metric_name="mse",
+                        value=float(ensemble_mse),
+                        fold=None,
+                        split="validation",
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to log ensemble metric: %s", exc)
+
+        # ----------------------------------------------------------------
+        # Forward the latest orchestrator feedback iteration to the tracker
+        # so that feedback_loop_progress.png is populated after a reload.
+        # ----------------------------------------------------------------
+        if phase == "OrchestratorAgent":
+            decision_history: List[Dict[str, Any]] = state.get("decision_history") or []
+            if decision_history:
+                latest = decision_history[-1]
+                ensemble_mse = latest.get("ensemble_mse")
+                if ensemble_mse is not None:
+                    try:
+                        tracker.log_feedback_iteration(
+                            iteration=int(latest.get("iteration", len(decision_history) - 1)) + 1,
+                            best_mse=float(ensemble_mse),
+                            improvements=(
+                                [latest.get("reasoning", "")]
+                                if latest.get("decision") == "IMPROVE"
+                                else []
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to log feedback iteration: %s", exc
+                        )
+
         return state
 
     _node.__name__ = f"agent_{agent.name.lower()}"
