@@ -325,11 +325,15 @@ Respond with JSON only.
         if self.ID_COL not in test.columns:
             errors.append(f"test missing '{self.ID_COL}' column.")
 
-        # Check no duplicated IDs in train
+        # Warn about duplicated IDs in train (not fatal — many real datasets have them)
         if self.ID_COL in train.columns:
             n_dup_ids = int(train[self.ID_COL].duplicated().sum())
             if n_dup_ids > 0:
-                errors.append(f"train has {n_dup_ids} duplicated '{self.ID_COL}' values.")
+                self._log(
+                    f"train has {n_dup_ids} duplicated '{self.ID_COL}' values "
+                    f"(kept as-is — duplicates are common in rental listings).",
+                    level="warning",
+                )
 
         # Check no NaN in target
         if self.TARGET_COL in train.columns:

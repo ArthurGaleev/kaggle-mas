@@ -206,7 +206,9 @@ def _make_input_guard_node(
             try:
                 import json
                 text = json.dumps(cleaning_plan)
-                safety_guard.scan(text)
+                sanitized = safety_guard.sanitize_llm_response(text)
+                if sanitized != text:
+                    issues.append("Cleaning plan was sanitized by SafetyGuard.")
             except Exception as exc:
                 logger.warning("[InputGuard] safety scan failed: %s", exc)
 

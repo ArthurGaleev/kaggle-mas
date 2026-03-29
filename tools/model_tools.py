@@ -16,6 +16,36 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _gpu_available() -> bool:
+    """Check if a CUDA GPU is available for tree-model training."""
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        pass
+    # Fallback: check nvidia-smi
+    import shutil, subprocess
+    if shutil.which("nvidia-smi"):
+        try:
+            subprocess.run(["nvidia-smi"], capture_output=True, check=True)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+_GPU_READY: bool | None = None
+
+
+def gpu_available() -> bool:
+    """Cached GPU check (called once per process)."""
+    global _GPU_READY
+    if _GPU_READY is None:
+        _GPU_READY = _gpu_available()
+        logger.info("GPU available: %s", _GPU_READY)
+    return _GPU_READY
+
+
 class ModelTools:
     """
     Static utility methods for model training, hyperparameter optimisation,
@@ -79,6 +109,12 @@ class ModelTools:
         params.setdefault("metric",     "mse")
         params.setdefault("verbosity",  -1)
         params.setdefault("seed",       42)
+
+        # GPU acceleration
+        if gpu_available() and "device" not in params:
+            params["device"] = "gpu"
+            params.setdefault("gpu_use_dp", False)
+            logger.info("[ModelTools] LightGBM using GPU.")
 
         dtrain = lgb.Dataset(X_train, label=y_train)
         dval   = lgb.Dataset(X_val,   label=y_val, reference=dtrain)
@@ -147,6 +183,12 @@ class ModelTools:
         params.setdefault("seed",        42)
         params.setdefault("verbosity",   0)
 
+        # GPU acceleration
+        if gpu_available() and "device" not in params:
+            params["device"] = "cuda"
+            params.setdefault("tree_method", "hist")
+            logger.info("[ModelTools] XGBoost using GPU (cuda).")
+
         dtrain = xgb.DMatrix(X_train, label=y_train)
         dval   = xgb.DMatrix(X_val,   label=y_val)
 
@@ -211,6 +253,12 @@ class ModelTools:
         params.setdefault("eval_metric",    "RMSE")
         params.setdefault("random_seed",    42)
         params.setdefault("verbose",        0)
+
+        # GPU acceleration
+        if gpu_available() and "task_type" not in params:
+            params["task_type"] = "GPU"
+            params.setdefault("devices", "0")
+            logger.info("[ModelTools] CatBoost using GPU.")
 
         train_pool = Pool(X_train, label=y_train)
         val_pool   = Pool(X_val,   label=y_val)
