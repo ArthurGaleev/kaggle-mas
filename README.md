@@ -12,22 +12,22 @@ For a detailed breakdown of each agent, the LangGraph state flow, RAG integratio
 ┌──────────────────────────────────────────────────────────────────┐
 │  Kaggle Competition: mws-ai-agents-2026 (Rental Price MSE)       │
 │                                                                  │
-│  ┌───────────┐    ┌────────────┐    ┌───────────┐               │
-│  │ DataAgent │ →  │FeatureAgent│ →  │ModelAgent │               │
-│  │           │    │            │    │  LightGBM │               │
-│  │ Profile   │    │ Datetime   │    │  XGBoost  │               │
-│  │ Clean     │    │ Geo/Text   │    │  CatBoost │               │
-│  │ + LLM     │    │ Encodings  │    │  + Optuna │               │
-│  └───────────┘    └────────────┘    └─────┬─────┘               │
+│  ┌───────────┐    ┌────────────┐    ┌───────────┐                │
+│  │ DataAgent │ →  │FeatureAgent│ →  │ModelAgent │                │
+│  │           │    │            │    │  LightGBM │                │
+│  │ Profile   │    │ Datetime   │    │  XGBoost  │                │
+│  │ Clean     │    │ Geo/Text   │    │  CatBoost │                │
+│  │ + LLM     │    │ Encodings  │    │  + Optuna │                │
+│  └───────────┘    └────────────┘    └─────┬─────┘                │
 │                                           │                      │
 │  ┌─────────────────┐    ┌───────────────┐ │                      │
-│  │ OrchestratorAgent│ ← │ EvaluatorAgent│◄┘                     │
+│  │ OrchestratorAgent│ ← │ EvaluatorAgent│◄┘                      │
 │  │                  │   │               │                        │
 │  │ ACCEPT → END     │   │ OOF MSE/RMSE  │                        │
 │  │ IMPROVE → loop   │   │ LLM interpret │                        │
 │  └──────────────────┘   └───────────────┘                        │
 │                                                                  │
-│  ─── Supporting systems ─────────────────────────────────────── │
+│  ─── Supporting systems ───────────────────────────────────────  │
 │  RAG Knowledge Base  │  Guardrails  │  Monitoring  │  Hydra Cfg  │
 └──────────────────────────────────────────────────────────────────┘
 ```
