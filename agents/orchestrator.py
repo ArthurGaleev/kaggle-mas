@@ -74,19 +74,33 @@ class OrchestratorAgent(BaseAgent):
         interpretation = state.get("llm_interpretation", "")
         iteration = state.get("iteration", 0)
         max_iter = int(OmegaConf.select(self.cfg, "max_iterations", default=3))
+        target_mse = float(OmegaConf.select(self.cfg, "target_mse_threshold", default=1500.0))
         history_summary = self._format_history(state.get("decision_history", []))
 
         ens = report.get("ensemble", {}).get("oof_metrics", {})
+        current_mse = ens.get("mse", None)
         per_algo = report.get("per_algorithm", {})
         best_algo = min(per_algo, key=lambda a: per_algo[a]["oof_metrics"]["mse"], default="N/A")
         best_mse = per_algo.get(best_algo, {}).get("oof_metrics", {}).get("mse", "N/A")
+
+        # Compute relative improvement vs. previous iteration for the prompt
+        prev_mse: Optional[float] = None
+        history = state.get("decision_history", [])
+        if history:
+            prev_mse = history[-1].get("ensemble_mse")
+        rel_improvement_str = "N/A (first iteration)"
+        if prev_mse is not None and prev_mse > 0 and current_mse is not None:
+            rel_improvement = (prev_mse - current_mse) / prev_mse * 100
+            rel_improvement_str = f"{rel_improvement:+.2f}%"
 
         prompt = f"""
 ## Iteration {iteration + 1} / {max_iter}
 
 ### Current ensemble OOF metrics
-MSE={ens.get('mse', 'N/A')}, RMSE={ens.get('rmse', 'N/A')}, R²={ens.get('r2', 'N/A')}
+MSE={ens.get('mse', 'N/A')}, RMSE={ens.get('rmse', 'N/A')}, R\u00b2={ens.get('r2', 'N/A')}
 
+### Target MSE threshold (from pipeline config): {target_mse}
+### Relative MSE improvement vs. previous iteration: {rel_improvement_str}
 ### Best single algorithm: {best_algo} (MSE={best_mse})
 
 ### EvaluatorAgent interpretation
@@ -99,10 +113,13 @@ MSE={ens.get('mse', 'N/A')}, RMSE={ens.get('rmse', 'N/A')}, R²={ens.get('r2', '
 Decide whether to ACCEPT the current results or to IMPROVE the pipeline.
 
 Rules:
-- ACCEPT if: (a) MSE improvement from the last iteration was < 2%, OR
-              (b) this is the last allowed iteration ({max_iter}), OR
-              (c) results are already strong (e.g. R² > 0.90).
-- IMPROVE only if there is a specific, achievable change with realistic impact.
+- ACCEPT if ALL of the following are true:
+    (a) Current MSE <= {target_mse} (absolute threshold), OR
+    (b) MSE improvement from the last iteration was < 2%, OR
+    (c) This is the last allowed iteration ({max_iter}), OR
+    (d) Results are already strong (e.g. R\u00b2 > 0.90).
+- IMPROVE if current MSE is still above {target_mse} AND there is a specific,
+  achievable change with realistic impact.
 
 If IMPROVE, specify which agent to re-run and exactly what to change.
 

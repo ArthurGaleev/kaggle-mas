@@ -10,6 +10,20 @@ GPU handling is centralised in ``tools.model_tools.ModelTools``:
   - ``gpu_available()``  — cached CUDA probe + OpenCL ICD setup for LightGBM
   - ``ModelTools.train_lightgbm/xgboost/catboost`` — inject the correct
     device/tree_method/task_type param and fall back to CPU transparently.
+
+OOF TARGET ENCODING
+--------------------
+If the feature plan requests target encoding, the raw categorical columns
+(host_name, location_cluster, type_house) are present in train_feat / test_feat
+as object-dtype columns.  ModelAgent computes a smoothed mean encoding map
+from the *training fold only* at the start of each KFold iteration and applies
+it to both the fold's training and validation splits, preventing leakage.
+
+OPTUNA TUNING SPLIT
+--------------------
+Hyperparameter search uses the *first KFold fold* (not a separate random
+80/20 split) so the tuning validation set never overlaps with the training
+portion of that fold, eliminating optimistic bias in the found parameters.
 """
 
 import gc
@@ -27,6 +41,7 @@ from sklearn.model_selection import KFold
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 from agents.base import BaseAgent
+from agents.feature_agent import _compute_target_encoding_map
 from tools.model_tools import ModelTools, gpu_available
 from utils.helpers import safe_json_parse
 
@@ -56,6 +71,7 @@ class ModelAgent(BaseAgent):
         target_series (pd.Series):   target values.
         test_ids      (pd.Series):   _id column for submission.
         feature_names (list[str]):   feature column names.
+        feature_plan  (dict, opt):   plan from FeatureAgent (target enc config).
         improvement_plan (dict, opt): hints from OrchestratorAgent.
 
     State keys produced:
@@ -76,6 +92,9 @@ class ModelAgent(BaseAgent):
         "models for a rental-property regression competition (MSE metric). "
         "Return compact, resource-efficient hyperparameter search spaces in strict JSON."
     )
+
+    # Categorical columns subject to target encoding (mirrors FeatureAgent)
+    _TE_COLS = ("host_name", "location_cluster", "type_house")
 
     # ------------------------------------------------------------------
     # LLM plan request
@@ -283,6 +302,82 @@ Respond with JSON only.
         return model, float(mean_squared_error(y_val, val_pred))
 
     # ------------------------------------------------------------------
+    # Per-fold target encoding
+    # ------------------------------------------------------------------
+
+    def _apply_fold_target_encoding(
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        target_fold: np.ndarray,
+        global_mean: float,
+        smoothing: float,
+        feature_names: List[str],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
+        """
+        Apply smoothed target-mean encoding using only the training fold's
+        labels, then return updated numpy arrays and extended feature names.
+
+        Parameters
+        ----------
+        train_df, val_df, test_df:
+            DataFrames that still contain the raw TE placeholder columns.
+        target_fold:
+            Target values for the *training fold only* (no leakage).
+        global_mean:
+            Global mean of the full target, used as a Bayesian prior.
+        smoothing:
+            Smoothing weight for the Bayesian prior.
+        feature_names:
+            Existing numeric feature names (TE cols not yet included).
+
+        Returns
+        -------
+        Updated X_tr, X_vl, X_te arrays and extended feature_names list.
+        """
+        te_cols_present = [c for c in self._TE_COLS if c in train_df.columns]
+        if not te_cols_present:
+            return (
+                train_df.drop(columns=list(self._TE_COLS), errors="ignore").values.astype(np.float32),
+                val_df.drop(columns=list(self._TE_COLS), errors="ignore").values.astype(np.float32),
+                test_df.drop(columns=list(self._TE_COLS), errors="ignore").values.astype(np.float32),
+                feature_names,
+            )
+
+        new_names = list(feature_names)
+        extra_train, extra_val, extra_test = [], [], []
+
+        for col in te_cols_present:
+            mapping = _compute_target_encoding_map(
+                col=train_df[col],
+                target=pd.Series(target_fold, index=train_df.index),
+                global_mean=global_mean,
+                smoothing=smoothing,
+            )
+            feat = f"te_{col}"
+            extra_train.append(train_df[col].map(mapping).fillna(global_mean).values)
+            extra_val.append(val_df[col].map(mapping).fillna(global_mean).values)
+            extra_test.append(test_df[col].map(mapping).fillna(global_mean).values)
+            new_names.append(feat)
+
+        # Build numeric matrices: numeric features + TE features
+        num_cols = [c for c in train_df.columns if c not in self._TE_COLS]
+
+        def _stack(df: pd.DataFrame, extras: List[np.ndarray]) -> np.ndarray:
+            base = df[num_cols].values.astype(np.float32)
+            if extras:
+                return np.hstack([base, np.column_stack(extras).astype(np.float32)])
+            return base
+
+        return (
+            _stack(train_df, extra_train),
+            _stack(val_df, extra_val),
+            _stack(test_df, extra_test),
+            new_names,
+        )
+
+    # ------------------------------------------------------------------
     # Optuna tuning per algorithm
     # ------------------------------------------------------------------
 
@@ -293,10 +388,15 @@ Respond with JSON only.
         X: np.ndarray,
         y: np.ndarray,
         seed: int,
+        n_splits: int,
     ) -> Dict[str, Any]:
         """
-        Run Optuna to find best hyperparameters for one algorithm using
-        a single validation fold (not full CV, to stay within Colab time budget).
+        Run Optuna to find best hyperparameters for one algorithm.
+
+        Uses the **first KFold fold** as the tuning validation set so there is
+        no overlap between the tuning validation rows and the training portion
+        of that fold, eliminating the optimistic bias from a separate random
+        80/20 split.
         """
         search_space = algo_cfg.get("search_space", {})
         fixed = algo_cfg.get("fixed_params", {})
@@ -308,10 +408,9 @@ Respond with JSON only.
             "catboost": self._train_catboost,
         }[algo]
 
-        # Use 80/20 split for tuning (fast single-split)
-        split_idx = int(len(X) * 0.8)
-        idx = np.random.default_rng(seed).permutation(len(X))
-        tune_train_idx, tune_val_idx = idx[:split_idx], idx[split_idx:]
+        # Use the first KFold fold for tuning (deterministic, no overlap with later CV)
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        tune_train_idx, tune_val_idx = next(iter(kf.split(X)))
         X_t, y_t = X[tune_train_idx], y[tune_train_idx]
         X_v, y_v = X[tune_val_idx], y[tune_val_idx]
 
@@ -358,15 +457,21 @@ Respond with JSON only.
         algo: str,
         algo_cfg: Dict[str, Any],
         best_params: Dict[str, Any],
-        X: np.ndarray,
+        X_df: pd.DataFrame,
         y: np.ndarray,
-        X_test: np.ndarray,
+        test_df: pd.DataFrame,
         n_splits: int,
         seed: int,
         feature_names: List[str],
+        te_smoothing: float,
+        global_mean: float,
     ) -> Dict[str, Any]:
         """
         Train the algorithm with best_params across n_splits folds.
+
+        Target encoding (if enabled) is applied *inside* each fold using only
+        the fold's training rows to prevent leakage into the validation fold.
+
         Returns OOF preds, fold MSEs, test preds, and feature importances.
         """
         fixed = dict(algo_cfg.get("fixed_params", {}))
@@ -378,19 +483,32 @@ Respond with JSON only.
 
         kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
         oof_preds = np.zeros(len(y))
-        test_preds_folds = np.zeros((len(X_test), n_splits))
+        test_preds_folds: List[np.ndarray] = []
         fold_mses: List[float] = []
         models: List[Any] = []
         importances: List[np.ndarray] = []
 
-        for fold_idx, (train_idx, val_idx) in enumerate(kf.split(X)):
-            X_tr, y_tr = X[train_idx], y[train_idx]
-            X_vl, y_vl = X[val_idx], y[val_idx]
+        indices = np.arange(len(y))
+        for fold_idx, (train_idx, val_idx) in enumerate(kf.split(indices)):
+            train_fold_df = X_df.iloc[train_idx].reset_index(drop=True)
+            val_fold_df   = X_df.iloc[val_idx].reset_index(drop=True)
+            y_tr = y[train_idx]
+            y_vl = y[val_idx]
+
+            # Apply per-fold target encoding (no leakage)
+            X_tr, X_vl, X_te, fold_feat_names = self._apply_fold_target_encoding(
+                train_df=train_fold_df,
+                val_df=val_fold_df,
+                test_df=test_df.reset_index(drop=True),
+                target_fold=y_tr,
+                global_mean=global_mean,
+                smoothing=te_smoothing,
+                feature_names=feature_names,
+            )
 
             model, fold_mse = train_fn(X_tr, y_tr, X_vl, y_vl, dict(best_params), dict(fixed))
-            # Use _predict() so xgb.Booster gets a DMatrix, not a raw ndarray
             oof_preds[val_idx] = self._predict(model, X_vl)
-            test_preds_folds[:, fold_idx] = self._predict(model, X_test)
+            test_preds_folds.append(self._predict(model, X_te))
             fold_mses.append(fold_mse)
             models.append(model)
 
@@ -404,13 +522,14 @@ Respond with JSON only.
 
         gc.collect()
 
-        mean_imp = np.mean(importances, axis=0) if importances else np.zeros(len(feature_names))
-        imp_dict = dict(zip(feature_names, mean_imp.tolist()))
+        test_preds_mean = np.mean(np.column_stack(test_preds_folds), axis=1)
+        mean_imp = np.mean(importances, axis=0) if importances else np.zeros(len(fold_feat_names))
+        imp_dict = dict(zip(fold_feat_names, mean_imp.tolist()))
 
         return {
             "models": models,
             "oof_predictions": oof_preds,
-            "test_predictions": test_preds_folds.mean(axis=1),
+            "test_predictions": test_preds_mean,
             "fold_mses": fold_mses,
             "mean_cv_mse": float(np.mean(fold_mses)),
             "std_cv_mse": float(np.std(fold_mses)),
@@ -454,33 +573,36 @@ Respond with JSON only.
         return oof_ensemble, test_ensemble, weight_dict
 
     # ------------------------------------------------------------------
-    # Submission builder (extracted for clarity and testability)
+    # Submission builder
     # ------------------------------------------------------------------
 
     @staticmethod
     def _build_submission(
         test_ensemble: np.ndarray,
+        test_ids: pd.Series,
     ) -> pd.DataFrame:
         """
-        Build a submission DataFrame with columns ``[index, prediction]``.
+        Build a submission DataFrame with the actual test ``_id`` values.
 
-        The ``index`` column is a simple integer range from 0 to
-        ``len(test_ensemble) - 1``, matching the row order of the test set.
-        No deduplication or sorting is performed.
+        Using the real IDs (rather than a bare integer range) ensures the
+        submission rows are correctly matched to test examples even when the
+        test set is not pre-sorted by row order.
 
         Parameters
         ----------
         test_ensemble:
             Array of ensemble predictions for the test set.
+        test_ids:
+            ``_id`` column values from the original test DataFrame.
 
         Returns
         -------
         pd.DataFrame
-            Columns: ``index`` (0-based integer), ``prediction`` (float).
+            Columns: ``_id`` (original test IDs), ``prediction`` (float).
         """
         return pd.DataFrame(
             {
-                "index": np.arange(len(test_ensemble)),
+                "_id": test_ids.values,
                 "prediction": test_ensemble,
             }
         )
@@ -492,16 +614,36 @@ Respond with JSON only.
     def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """
         1. Ask LLM for model plan.
-        2. Tune each enabled algorithm with Optuna.
-        3. Train with K-fold CV using best params.
+        2. Tune each enabled algorithm with Optuna (first KFold fold).
+        3. Train with K-fold CV using best params; apply target encoding
+           inside each fold to prevent leakage.
         4. Build ensemble.
         5. Populate state with submission_df (saving to disk is main.py's responsibility).
         """
-        X: np.ndarray = state["train_feat"].values.astype(np.float32)
+        X_df: pd.DataFrame = state["train_feat"]   # may contain TE placeholder cols
+        test_df: pd.DataFrame = state["test_feat"]
         y: np.ndarray = state["target_series"].values.astype(np.float32)
-        X_test: np.ndarray = state["test_feat"].values.astype(np.float32)
         test_ids: pd.Series = state["test_ids"]
         feature_names: List[str] = state["feature_names"]
+
+        # Read target-encoding config from feature plan
+        feature_plan = state.get("feature_plan", {})
+        te_cfg = feature_plan.get("groups", {}).get("target_encoding", {})
+        te_enabled: bool = te_cfg.get("enabled", True)
+        te_smoothing: float = float(te_cfg.get("smoothing", 10.0))
+        global_mean: float = float(y.mean())
+
+        # If TE not enabled, drop TE placeholder columns before building arrays
+        if not te_enabled:
+            drop_te = [c for c in self._TE_COLS if c in X_df.columns]
+            if drop_te:
+                X_df = X_df.drop(columns=drop_te)
+                test_df = test_df.drop(columns=drop_te, errors="ignore")
+
+        # Build pure-numeric arrays for Optuna tuning (no TE — uses first fold only)
+        # TE will be applied fold-by-fold inside _cross_validate_algorithm.
+        num_cols = [c for c in X_df.columns if c not in self._TE_COLS]
+        X_numeric: np.ndarray = X_df[num_cols].values.astype(np.float32)
 
         # Log GPU status once at the start (uses cached check from ModelTools)
         _logger.info("[GPU] GPU available: %s", gpu_available())
@@ -525,7 +667,10 @@ Respond with JSON only.
             self._log(f"Tuning {algo} with Optuna ({algo_cfg.get('n_trials', 20)} trials)\u2026")
 
             try:
-                best_params = self._tune_algorithm(algo, algo_cfg, X, y, seed)
+                # Pass pure-numeric X for Optuna (TE not needed here — first-fold split)
+                best_params = self._tune_algorithm(
+                    algo, algo_cfg, X_numeric, y, seed, n_splits
+                )
             except Exception as exc:
                 self._log(f"Optuna tuning failed for {algo}: {exc}. Using fixed params.", level="warning")
                 best_params = {}
@@ -533,7 +678,17 @@ Respond with JSON only.
             self._log(f"CV training {algo}\u2026")
             try:
                 result = self._cross_validate_algorithm(
-                    algo, algo_cfg, best_params, X, y, X_test, n_splits, seed, feature_names
+                    algo=algo,
+                    algo_cfg=algo_cfg,
+                    best_params=best_params,
+                    X_df=X_df,
+                    y=y,
+                    test_df=test_df,
+                    n_splits=n_splits,
+                    seed=seed,
+                    feature_names=feature_names,
+                    te_smoothing=te_smoothing,
+                    global_mean=global_mean,
                 )
                 oof_results[algo] = result
                 test_predictions[algo] = result["test_predictions"]
@@ -557,7 +712,7 @@ Respond with JSON only.
         self._log(f"Ensemble OOF MSE={ensemble_mse:.4f}")
 
         # --- Submission --- (saving to disk is owned by main.py)
-        submission = self._build_submission(test_ensemble)
+        submission = self._build_submission(test_ensemble, test_ids)
 
         # --- Store in state ---
         state["models"] = {a: r["models"] for a, r in oof_results.items()}

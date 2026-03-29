@@ -5,6 +5,22 @@ plan deterministically using pandas / sklearn / scipy.
 All heavy computation (KMeans, TF-IDF, SVD, scaling …) is done in Python;
 the LLM only decides which feature groups to activate and any non-trivial
 parameter choices.
+
+NOTE ON TARGET ENCODING
+-----------------------
+Target encoding is intentionally NOT applied inside this agent to prevent
+data leakage.  If the feature plan enables `target_encoding`, this agent
+stores the request in the feature plan but defers execution to ModelAgent,
+which applies the encoding *inside* each KFold split using only the training
+fold.  Use `_compute_target_encoding_map` (exported below) for that purpose.
+
+NOTE ON SCALING
+---------------
+StandardScaler is deliberately omitted from the pipeline.  Tree-based GBDT
+models (LightGBM / XGBoost / CatBoost) are invariant to monotonic feature
+transformations, so scaling neither hurts nor helps them — but fitting a
+scaler on the full training set before CV splits leaks validation-fold
+statistics into training data, inflating OOF performance estimates.
 """
 
 import gc
@@ -20,10 +36,48 @@ from omegaconf import DictConfig
 from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder
 
 from agents.base import BaseAgent
 from utils.helpers import safe_json_parse
+
+
+def _compute_target_encoding_map(
+    col: pd.Series,
+    target: pd.Series,
+    global_mean: float,
+    smoothing: float = 10.0,
+) -> Dict[Any, float]:
+    """
+    Compute a smoothed target-mean encoding map from a *single fold's*
+    training data.  Must be called inside each CV fold by ModelAgent.
+
+    Parameters
+    ----------
+    col:
+        Categorical column values (training fold only).
+    target:
+        Corresponding target values (training fold only).
+    global_mean:
+        Global mean of the target computed on the *full* training set
+        (used as the smoothing prior — acceptable to compute once).
+    smoothing:
+        Bayesian smoothing weight; higher = stronger shrinkage towards mean.
+
+    Returns
+    -------
+    dict mapping category value → smoothed mean.
+    """
+    stats = (
+        pd.DataFrame({"col": col.values, "target": target.values})
+        .groupby("col")["target"]
+        .agg(["count", "mean"])
+    )
+    stats["smoothed"] = (
+        (stats["count"] * stats["mean"] + smoothing * global_mean)
+        / (stats["count"] + smoothing)
+    )
+    return stats["smoothed"].to_dict()
 
 
 class FeatureAgent(BaseAgent):
@@ -74,6 +128,10 @@ class FeatureAgent(BaseAgent):
         "target": "numeric — rental price to predict",
     }
 
+    # Categorical columns that target encoding operates on;
+    # encoding itself is deferred to ModelAgent (inside each CV fold).
+    TARGET_ENCODE_COLS = ("host_name", "location_cluster", "type_house")
+
     # ------------------------------------------------------------------
     # LLM plan request
     # ------------------------------------------------------------------
@@ -97,7 +155,8 @@ Train shape after cleaning: {train_shape}.
 1. datetime_features   — extract year/month/day_of_week/is_weekend/days_since_last_review from 'last_dt'
 2. geo_features        — KMeans geo-clusters from lat/lon; haversine distance to city centroid
 3. text_features       — TF-IDF + SVD on 'name' and 'location' columns (low-dimensional)
-4. target_encoding     — target-mean encoding for 'host_name', 'location_cluster', 'type_house'
+4. target_encoding     — smoothed target-mean encoding (applied INSIDE each CV fold by ModelAgent
+                         to prevent leakage; enabling this flag just reserves the column set)
 5. frequency_encoding  — count/frequency encoding for high-cardinality categoricals
 6. interaction_features — pairwise products of key numeric pairs
 7. log_transforms      — log1p of right-skewed numeric columns
@@ -121,8 +180,7 @@ Schema:
     "polynomial_features":  {{"enabled": false}},
     "label_encoding":       {{"enabled": true, "columns": ["type_house", "location_cluster"]}}
   }},
-  "drop_low_importance": true,
-  "scale_features": true
+  "drop_low_importance": true
 }}
 Respond with JSON only.
 """
@@ -142,7 +200,6 @@ Respond with JSON only.
                 "label_encoding":       {"enabled": True, "columns": ["type_house", "location_cluster"]},
             },
             "drop_low_importance": True,
-            "scale_features": True,
         }
         return self._ask_llm_json(prompt, default=default)
 
@@ -255,46 +312,15 @@ Respond with JSON only.
 
         return train, test
 
-    def _add_target_encoding(
-        self,
-        train: pd.DataFrame,
-        test: pd.DataFrame,
-        target: pd.Series,
-        smoothing: float = 10.0,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Smoothed target-mean encoding for categorical columns."""
-        cat_cols = [c for c in ("host_name", "location_cluster", "type_house") if c in train.columns]
-        global_mean = float(target.mean())
-
-        for col in cat_cols:
-            stats = (
-                pd.DataFrame({col: train[col], "target": target.values})
-                .groupby(col)["target"]
-                .agg(["count", "mean"])
-            )
-            stats["smoothed"] = (
-                (stats["count"] * stats["mean"] + smoothing * global_mean)
-                / (stats["count"] + smoothing)
-            )
-            mapping = stats["smoothed"].to_dict()
-
-            feat = f"te_{col}"
-            train[feat] = train[col].map(mapping).fillna(global_mean)
-            test[feat] = test[col].map(mapping).fillna(global_mean)
-
-        # Drop original categorical columns (now encoded)
-        train.drop(columns=[c for c in cat_cols if c in train.columns], inplace=True)
-        test.drop(columns=[c for c in cat_cols if c in test.columns], inplace=True)
-
-        return train, test
-
     def _add_frequency_encoding(
         self,
         train: pd.DataFrame,
         test: pd.DataFrame,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Count/frequency encoding for high-cardinality categoricals."""
-        cat_cols = [c for c in ("host_name", "location_cluster", "type_house") if c in train.columns]
+        # Operate on a snapshot of column names so we don't miss cols that
+        # other encoding steps may have already dropped.
+        cat_cols = [c for c in self.TARGET_ENCODE_COLS if c in train.columns]
 
         for col in cat_cols:
             freq_map = train[col].value_counts(normalize=True).to_dict()
@@ -328,7 +354,8 @@ Respond with JSON only.
         test: pd.DataFrame,
         columns: Optional[List[str]] = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """log1p transform for right-skewed columns."""
+        """log1p transform for right-skewed columns; original column is kept
+        so models can choose which representation is more useful."""
         if columns is None:
             columns = ["sum", "min_days", "amt_reviews", "total_host"]
 
@@ -363,25 +390,6 @@ Respond with JSON only.
 
         return train, test
 
-    def _apply_scaling(
-        self,
-        train: pd.DataFrame,
-        test: pd.DataFrame,
-        exclude: Optional[List[str]] = None,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, StandardScaler]:
-        """Standard-scale all numeric features (fit on train only)."""
-        if exclude is None:
-            exclude = []
-        num_cols = [
-            c for c in train.select_dtypes(include=[np.number]).columns
-            if c not in exclude
-        ]
-        scaler = StandardScaler()
-        train[num_cols] = scaler.fit_transform(train[num_cols])
-        test_num_cols = [c for c in num_cols if c in test.columns]
-        test[test_num_cols] = scaler.transform(test[test_num_cols])
-        return train, test, scaler
-
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
@@ -389,6 +397,11 @@ Respond with JSON only.
     def execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """
         Ask the LLM for a feature plan, execute it, validate, and store results.
+
+        Target encoding is deliberately skipped here and deferred to ModelAgent
+        so it can be applied inside each CV fold without leakage.  The feature
+        plan is stored in state so ModelAgent knows which columns to encode and
+        what smoothing factor to use.
         """
         # --- Pull DataFrames from state ---
         train: pd.DataFrame = state["train_df"].copy()
@@ -409,6 +422,12 @@ Respond with JSON only.
         self._log(f"Feature plan enabled groups: {[g for g, cfg in groups.items() if cfg.get('enabled')]}")
 
         # --- Execute each feature group ---
+
+        # Frequency encoding MUST run before any group that drops the raw
+        # categorical columns, so we get freq features from the originals.
+        if groups.get("frequency_encoding", {}).get("enabled", True):
+            train, test = self._add_frequency_encoding(train, test)
+
         if groups.get("datetime_features", {}).get("enabled", True):
             train, test = self._add_datetime_features(train, test)
 
@@ -421,12 +440,10 @@ Respond with JSON only.
             max_feat = groups.get("text_features", {}).get("max_features", 300)
             train, test = self._add_text_features(train, test, n_components=n_comp, max_features=max_feat)
 
-        if groups.get("target_encoding", {}).get("enabled", True):
-            smoothing = groups.get("target_encoding", {}).get("smoothing", 10.0)
-            train, test = self._add_target_encoding(train, test, target, smoothing=smoothing)
-
-        if groups.get("frequency_encoding", {}).get("enabled", True):
-            train, test = self._add_frequency_encoding(train, test)
+        # target_encoding is intentionally skipped here — ModelAgent applies
+        # it inside each CV fold via _compute_target_encoding_map to prevent
+        # label leakage.  The raw categorical columns are kept in train/test
+        # for that purpose and dropped by ModelAgent after fold-level encoding.
 
         if groups.get("interaction_features", {}).get("enabled", True):
             pairs = groups.get("interaction_features", {}).get("pairs")
@@ -441,8 +458,19 @@ Respond with JSON only.
             train, test = self._add_label_encoding(train, test, columns=le_cols)
 
         # --- Drop any remaining object columns (not encoded yet) ---
-        obj_cols_train = train.select_dtypes(include="object").columns.tolist()
-        obj_cols_test = test.select_dtypes(include="object").columns.tolist()
+        # Keep TARGET_ENCODE_COLS if target_encoding is requested — ModelAgent
+        # needs them to compute per-fold maps.
+        te_enabled = groups.get("target_encoding", {}).get("enabled", True)
+        keep_for_te = set(self.TARGET_ENCODE_COLS) if te_enabled else set()
+
+        obj_cols_train = [
+            c for c in train.select_dtypes(include="object").columns
+            if c not in keep_for_te
+        ]
+        obj_cols_test = [
+            c for c in test.select_dtypes(include="object").columns
+            if c not in keep_for_te
+        ]
         drop_obj = list(set(obj_cols_train + obj_cols_test))
         if drop_obj:
             self._log(f"Dropping remaining object columns: {drop_obj}", level="warning")
@@ -456,31 +484,38 @@ Respond with JSON only.
             test.drop(columns=[c for c in dt_cols if c in test.columns], inplace=True, errors="ignore")
 
         # --- Align train/test columns ---
-        common_cols = [c for c in train.columns if c in test.columns]
-        train_only = [c for c in train.columns if c not in test.columns]
+        # Columns reserved for target encoding are excluded from the common-col
+        # check; they exist in both frames and will be handled by ModelAgent.
+        align_cols = [c for c in train.columns if c in test.columns]
+        train_only = [c for c in train.columns if c not in test.columns and c not in keep_for_te]
         if train_only:
             self._log(f"Columns in train but not test (dropping): {train_only}", level="warning")
-        train = train[common_cols]
-        test = test[common_cols]
+        train = train[align_cols]
+        test = test[align_cols]
 
         # --- Validate guardrail ---
-        if train.shape[1] > self.MAX_FEATURES:
+        non_te_cols = [c for c in train.columns if c not in keep_for_te]
+        if len(non_te_cols) > self.MAX_FEATURES:
             self._log(
-                f"Feature count {train.shape[1]} exceeds guardrail {self.MAX_FEATURES}. "
+                f"Feature count {len(non_te_cols)} exceeds guardrail {self.MAX_FEATURES}. "
                 "Truncating to top columns by variance.",
                 level="warning",
             )
-            variances = train.var().sort_values(ascending=False)
-            keep_cols = variances.index[: self.MAX_FEATURES].tolist()
+            variances = train[non_te_cols].var().sort_values(ascending=False)
+            keep_cols = variances.index[: self.MAX_FEATURES].tolist() + list(keep_for_te)
+            keep_cols = [c for c in train.columns if c in set(keep_cols)]  # preserve order
             train = train[keep_cols]
             test = test[keep_cols]
 
-        # --- Optional scaling ---
-        if plan.get("scale_features", True):
-            train, test, _ = self._apply_scaling(train, test)
+        # Scaling intentionally omitted — see module docstring.
 
-        feature_names: List[str] = train.columns.tolist()
-        self._log(f"Final feature count: {len(feature_names)}")
+        feature_names: List[str] = [
+            c for c in train.columns if c not in keep_for_te
+        ]
+        self._log(
+            f"Final feature count: {len(feature_names)}"
+            + (f" + {len(keep_for_te)} TE placeholder cols" if keep_for_te else "")
+        )
 
         # --- Store in state ---
         state["train_feat"] = train
