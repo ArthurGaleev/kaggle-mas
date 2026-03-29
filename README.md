@@ -6,6 +6,8 @@ A production-grade **multi-agent ML pipeline** for the `mws-ai-agents-2026` Kagg
 
 ## Architecture
 
+For a detailed breakdown of each agent, the LangGraph state flow, RAG integration, guardrails, feedback loop design, LLM provider configuration, and model selection rationale, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  Kaggle Competition: mws-ai-agents-2026 (Rental Price MSE)       │
