@@ -58,7 +58,7 @@ from omegaconf import DictConfig, OmegaConf
 # LangGraph imports
 try:
     from langgraph.graph import StateGraph, START, END
-    from langgraph.graph.graph import CompiledGraph
+    from langgraph.graph.state import CompiledStateGraph
     _LANGGRAPH_AVAILABLE = True
 except ImportError as _lg_err:
     _LANGGRAPH_AVAILABLE = False
@@ -321,7 +321,7 @@ def build_pipeline(
     input_validator: Any,
     output_validator: Any,
     safety_guard: Any,
-) -> "CompiledGraph":
+) -> "CompiledStateGraph":
     """
     Build and compile the LangGraph multi-agent pipeline.
 
@@ -337,7 +337,7 @@ def build_pipeline(
 
     Returns
     -------
-    CompiledGraph
+    CompiledStateGraph
         A compiled LangGraph ``StateGraph`` ready to invoke.
 
     Raises
