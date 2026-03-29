@@ -88,7 +88,7 @@ class ModelAgent(BaseAgent):
         ensemble_oof    (np.ndarray):    ensemble OOF predictions (raw price scale).
         test_predictions (dict):         test predictions per algorithm.
         ensemble_test   (np.ndarray):    weighted ensemble test predictions (raw price scale).
-        submission_df   (pd.DataFrame):  submission-ready DataFrame.
+        submission_df   (pd.DataFrame):  submission-ready DataFrame with integer index column.
         model_plan      (dict):          LLM-generated model plan.
         use_log_target  (bool):          whether log-transform was applied (always False).
     """
@@ -628,13 +628,23 @@ Respond with JSON only.
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_submission(
-        test_ensemble: np.ndarray,
-        test_ids: pd.Series,
-    ) -> pd.DataFrame:
+    def _build_submission(test_ensemble: np.ndarray) -> pd.DataFrame:
+        """
+        Build the submission DataFrame with a plain integer index column.
+
+        The competition expects:
+            index  | prediction
+            0      | 1234.5
+            1      | 2345.6
+            ...
+
+        Note: commit e4c94a8 changed this to use the _id column, but the
+        correct format is a bare 0-based integer range as the index column.
+        """
+        n = len(test_ensemble)
         return pd.DataFrame(
             {
-                "_id": test_ids.values,
+                "index": np.arange(n),
                 "prediction": test_ensemble,
             }
         )
@@ -746,12 +756,12 @@ Respond with JSON only.
         upper_cap = float(np.percentile(y, 99.5)) * 1.5
         test_ensemble = np.clip(test_ensemble, 0, upper_cap)
         oof_ensemble = np.clip(oof_ensemble, 0, upper_cap)
-        self._log(f"Predictions clipped to [0, {upper_cap:.1f}] (99.5th pct of target × 1.5)")
+        self._log(f"Predictions clipped to [0, {upper_cap:.1f}] (99.5th pct of target \u00d7 1.5)")
 
         ensemble_mse = float(mean_squared_error(y, oof_ensemble))
         self._log(f"Ensemble OOF MSE={ensemble_mse:.4f} (raw price scale)")
 
-        submission = self._build_submission(test_ensemble, test_ids)
+        submission = self._build_submission(test_ensemble)
 
         state["models"] = {a: r["models"] for a, r in oof_results.items()}
         state["oof_predictions"] = {a: r["oof_predictions"] for a, r in oof_results.items()}
